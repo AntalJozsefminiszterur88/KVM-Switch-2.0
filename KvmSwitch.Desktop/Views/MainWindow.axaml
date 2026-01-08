@@ -1,0 +1,132 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:KvmSwitch.Desktop.ViewModels"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d"
+        x:Class="KvmSwitch.Desktop.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Width="450"
+        Height="600"
+        CanResize="False"
+        Background="#1e1e1e"
+        Foreground="LightGray"
+        Title="KVM Switch Vezérlőpult v2.0">
+
+    <StackPanel Margin="16"
+                Spacing="12">
+        <Border Background="#252526"
+                CornerRadius="4"
+                Padding="10">
+            <StackPanel Spacing="8">
+                <TextBlock Text="Eszköz kiválasztása"
+                           FontWeight="Bold" />
+                <StackPanel Orientation="Horizontal"
+                            Spacing="16">
+                    <RadioButton Content="Asztali gép"
+                                 GroupName="DeviceRole"
+                                 IsChecked="{Binding IsInputProviderSelected}" />
+                    <RadioButton Content="Laptop"
+                                 GroupName="DeviceRole"
+                                 IsChecked="{Binding IsReceiverSelected}" />
+                    <RadioButton Content="EliteDesk"
+                                 GroupName="DeviceRole"
+                                 IsChecked="{Binding IsControllerSelected}" />
+                </StackPanel>
+            </StackPanel>
+        </Border>
+
+        <Border Background="#252526"
+                CornerRadius="4"
+                Padding="10">
+            <StackPanel Spacing="8">
+                <TextBlock Text="Hálózati Beállítások"
+                           FontWeight="Bold" />
+                <Grid RowDefinitions="Auto,Auto"
+                      ColumnDefinitions="Auto,*"
+                      ColumnSpacing="8"
+                      RowSpacing="8">
+                    <TextBlock Grid.Row="0"
+                               Grid.Column="0"
+                               Text="IP:" />
+                    <TextBox Grid.Row="0"
+                             Grid.Column="1"
+                             Text="{Binding TargetIp, Mode=TwoWay}"
+                             IsEnabled="{Binding !IsControllerSelected}" />
+
+                    <TextBlock Grid.Row="1"
+                               Grid.Column="0"
+                               Text="Port:" />
+                    <TextBox Grid.Row="1"
+                             Grid.Column="1"
+                             Text="{Binding Port, Mode=TwoWay}" />
+                </Grid>
+            </StackPanel>
+        </Border>
+
+        <Border Background="#252526"
+                CornerRadius="4"
+                Padding="10">
+            <StackPanel Spacing="8">
+                <TextBlock Text="Monitor Kódok"
+                           FontWeight="Bold" />
+                <Grid RowDefinitions="Auto,Auto"
+                      ColumnDefinitions="Auto,*"
+                      ColumnSpacing="8"
+                      RowSpacing="8">
+                    <TextBlock Grid.Row="0"
+                               Grid.Column="0"
+                               Text="Host kód:" />
+                    <TextBox Grid.Row="0"
+                             Grid.Column="1"
+                             Text="{Binding HostMonitorCode, Mode=TwoWay}" />
+
+                    <TextBlock Grid.Row="1"
+                               Grid.Column="0"
+                               Text="Kliens kód:" />
+                    <TextBox Grid.Row="1"
+                             Grid.Column="1"
+                             Text="{Binding ClientMonitorCode, Mode=TwoWay}" />
+                </Grid>
+            </StackPanel>
+        </Border>
+
+        <Border Background="#252526"
+                CornerRadius="4"
+                Padding="10">
+            <StackPanel Spacing="8">
+                <TextBlock Text="Egyéb Beállítások"
+                           FontWeight="Bold" />
+                <TextBlock Text="A szolgáltatás indítása után a kiválasztott szerepkör szerint kapcsolódik."
+                           TextWrapping="Wrap" />
+                <CheckBox Content="Automatikus indulás"
+                          IsChecked="{Binding AutoStartEnabled}" />
+            </StackPanel>
+        </Border>
+
+        <StackPanel Spacing="8">
+            <TextBlock Text="Fájlátvitel"
+                       FontWeight="Bold" />
+            <StackPanel Spacing="6">
+                <Button Content="LAN fájlátvitel megnyitása"
+                        Command="{Binding OpenFileTransferCommand}" />
+                <Button Content="Közös vágólap"
+                        Command="{Binding OpenClipboardCommand}" />
+            </StackPanel>
+        </StackPanel>
+
+        <Button Content="{Binding ButtonText}"
+                Command="{Binding ToggleServiceCommand}"
+                Height="48"
+                FontSize="16" />
+
+        <StackPanel Spacing="6">
+            <TextBlock Text="{Binding StatusMessage}" />
+            <ScrollViewer VerticalScrollBarVisibility="Auto"
+                          MaxHeight="140">
+                <TextBlock Text="{Binding LogOutput}"
+                           TextWrapping="Wrap" />
+            </ScrollViewer>
+        </StackPanel>
+    </StackPanel>
+</Window>
