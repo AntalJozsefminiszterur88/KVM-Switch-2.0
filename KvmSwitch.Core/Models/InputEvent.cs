@@ -17,5 +17,6 @@ namespace KvmSwitch.Core.Models
         public int MouseX { get; init; }
         public int MouseY { get; init; }
         public int MouseButton { get; init; }
+        public bool IsRelative { get; init; }
     }
 }

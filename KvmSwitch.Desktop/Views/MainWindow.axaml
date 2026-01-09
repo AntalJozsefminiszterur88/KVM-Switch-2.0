@@ -1,4 +1,4 @@
-<Window xmlns="https://github.com/avaloniaui"
+﻿<Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:KvmSwitch.Desktop.ViewModels"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
@@ -6,16 +6,58 @@
         mc:Ignorable="d"
         x:Class="KvmSwitch.Desktop.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
-        Width="450"
-        Height="600"
+        Width="{Binding WindowWidth}"
+        MinWidth="450"
+        SizeToContent="Height"
         CanResize="False"
-        Background="#1e1e1e"
-        Foreground="LightGray"
+        WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource AppBackgroundBrush}"
+        Foreground="{DynamicResource TextPrimaryBrush}"
+        Icon="/Assets/logo.ico"
         Title="KVM Switch Vezérlőpult v2.0">
 
-    <StackPanel Margin="16"
-                Spacing="12">
-        <Border Background="#252526"
+    <Window.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Light">
+                    <Color x:Key="AppBackgroundColor">#F5F6F8</Color>
+                    <Color x:Key="PanelBackgroundColor">#FFFFFF</Color>
+                    <Color x:Key="PanelBorderColor">#E1E4E8</Color>
+                    <Color x:Key="TextPrimaryColor">#1F2937</Color>
+                    <Color x:Key="TextMutedColor">#4B5563</Color>
+                    <Color x:Key="AccentColor">#3F51B5</Color>
+                    <Color x:Key="AccentForegroundColor">#FFFFFF</Color>
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Dark">
+                    <Color x:Key="AppBackgroundColor">#1E1E1E</Color>
+                    <Color x:Key="PanelBackgroundColor">#252526</Color>
+                    <Color x:Key="PanelBorderColor">#2C2C2C</Color>
+                    <Color x:Key="TextPrimaryColor">#E0E0E0</Color>
+                    <Color x:Key="TextMutedColor">#B0B0B0</Color>
+                    <Color x:Key="AccentColor">#3F51B5</Color>
+                    <Color x:Key="AccentForegroundColor">#FFFFFF</Color>
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+
+            <SolidColorBrush x:Key="AppBackgroundBrush" Color="{DynamicResource AppBackgroundColor}" />
+            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="{DynamicResource PanelBackgroundColor}" />
+            <SolidColorBrush x:Key="PanelBorderBrush" Color="{DynamicResource PanelBorderColor}" />
+            <SolidColorBrush x:Key="TextPrimaryBrush" Color="{DynamicResource TextPrimaryColor}" />
+            <SolidColorBrush x:Key="TextMutedBrush" Color="{DynamicResource TextMutedColor}" />
+            <SolidColorBrush x:Key="AccentBrush" Color="{DynamicResource AccentColor}" />
+            <SolidColorBrush x:Key="AccentForegroundBrush" Color="{DynamicResource AccentForegroundColor}" />
+        </ResourceDictionary>
+    </Window.Resources>
+
+    <Grid Margin="16"
+          ColumnDefinitions="*,Auto"
+          ColumnSpacing="12"
+          VerticalAlignment="Top">
+        <StackPanel Grid.Column="0"
+                    Spacing="12">
+        <Border Background="{DynamicResource PanelBackgroundBrush}"
+                BorderBrush="{DynamicResource PanelBorderBrush}"
+                BorderThickness="1"
                 CornerRadius="4"
                 Padding="10">
             <StackPanel Spacing="8">
@@ -36,35 +78,31 @@
             </StackPanel>
         </Border>
 
-        <Border Background="#252526"
+        <Border Background="{DynamicResource PanelBackgroundBrush}"
+                BorderBrush="{DynamicResource PanelBorderBrush}"
+                BorderThickness="1"
                 CornerRadius="4"
                 Padding="10">
             <StackPanel Spacing="8">
                 <TextBlock Text="Hálózati Beállítások"
                            FontWeight="Bold" />
-                <Grid RowDefinitions="Auto,Auto"
+                <Grid RowDefinitions="Auto"
                       ColumnDefinitions="Auto,*"
                       ColumnSpacing="8"
                       RowSpacing="8">
                     <TextBlock Grid.Row="0"
                                Grid.Column="0"
-                               Text="IP:" />
-                    <TextBox Grid.Row="0"
-                             Grid.Column="1"
-                             Text="{Binding TargetIp, Mode=TwoWay}"
-                             IsEnabled="{Binding !IsControllerSelected}" />
-
-                    <TextBlock Grid.Row="1"
-                               Grid.Column="0"
                                Text="Port:" />
-                    <TextBox Grid.Row="1"
+                    <TextBox Grid.Row="0"
                              Grid.Column="1"
                              Text="{Binding Port, Mode=TwoWay}" />
                 </Grid>
             </StackPanel>
         </Border>
 
-        <Border Background="#252526"
+        <Border Background="{DynamicResource PanelBackgroundBrush}"
+                BorderBrush="{DynamicResource PanelBorderBrush}"
+                BorderThickness="1"
                 CornerRadius="4"
                 Padding="10">
             <StackPanel Spacing="8">
@@ -91,42 +129,92 @@
             </StackPanel>
         </Border>
 
-        <Border Background="#252526"
+        <Border Background="{DynamicResource PanelBackgroundBrush}"
+                BorderBrush="{DynamicResource PanelBorderBrush}"
+                BorderThickness="1"
                 CornerRadius="4"
                 Padding="10">
             <StackPanel Spacing="8">
                 <TextBlock Text="Egyéb Beállítások"
                            FontWeight="Bold" />
                 <TextBlock Text="A szolgáltatás indítása után a kiválasztott szerepkör szerint kapcsolódik."
+                           Foreground="{DynamicResource TextMutedBrush}"
                            TextWrapping="Wrap" />
                 <CheckBox Content="Automatikus indulás"
                           IsChecked="{Binding AutoStartEnabled}" />
             </StackPanel>
         </Border>
 
-        <StackPanel Spacing="8">
-            <TextBlock Text="Fájlátvitel"
-                       FontWeight="Bold" />
-            <StackPanel Spacing="6">
-                <Button Content="LAN fájlátvitel megnyitása"
-                        Command="{Binding OpenFileTransferCommand}" />
-                <Button Content="Közös vágólap"
-                        Command="{Binding OpenClipboardCommand}" />
+        <Grid ColumnDefinitions="*,*"
+              ColumnSpacing="12">
+            <StackPanel Spacing="8"
+                        HorizontalAlignment="Stretch">
+                <TextBlock Text="Fájlátvitel"
+                           FontWeight="Bold" />
+                <StackPanel x:Name="FileTransferButtons"
+                            Spacing="6"
+                            HorizontalAlignment="Stretch">
+                    <Button Command="{Binding OpenFileTransferCommand}" HorizontalAlignment="Stretch">
+                        <TextBlock Text="LAN fájlátvitel megnyitása" TextWrapping="Wrap" TextAlignment="Center" />
+                    </Button>
+                    <Button x:Name="ClipboardButton"
+                            Content="Közös vágólap"
+                            Command="{Binding OpenClipboardCommand}" HorizontalAlignment="Stretch" />
+                </StackPanel>
             </StackPanel>
+
+            <Button Grid.Column="1"
+                    Command="{Binding ToggleServiceCommand}"
+                    Background="{DynamicResource AccentBrush}"
+                    Foreground="{DynamicResource AccentForegroundBrush}"
+                    Height="{Binding #FileTransferButtons.Bounds.Height}"
+                    FontSize="16"
+                    HorizontalAlignment="Stretch"
+                    VerticalAlignment="Bottom">
+                <TextBlock Text="{Binding ButtonText}"
+                           TextWrapping="Wrap"
+                           TextAlignment="Center" />
+            </Button>
+        </Grid>
+
+            <Border Background="{DynamicResource PanelBackgroundBrush}"
+                    BorderBrush="{DynamicResource PanelBorderBrush}"
+                    BorderThickness="1"
+                    CornerRadius="4"
+                    Padding="8"
+                    Height="52">
+                <Grid RowDefinitions="Auto,Auto"
+                      RowSpacing="2">
+                    <TextBlock Text="{Binding StatusLine1}"
+                               TextWrapping="NoWrap"
+                               TextTrimming="CharacterEllipsis" />
+                    <TextBlock Grid.Row="1"
+                               Text="{Binding StatusLine2}"
+                               TextWrapping="NoWrap"
+                               TextTrimming="CharacterEllipsis" />
+                </Grid>
+            </Border>
         </StackPanel>
 
-        <Button Content="{Binding ButtonText}"
-                Command="{Binding ToggleServiceCommand}"
-                Height="48"
-                FontSize="16" />
-
-        <StackPanel Spacing="6">
-            <TextBlock Text="{Binding StatusMessage}" />
-            <ScrollViewer VerticalScrollBarVisibility="Auto"
-                          MaxHeight="140">
-                <TextBlock Text="{Binding LogOutput}"
+        <Border Grid.Column="1"
+                IsVisible="{Binding IsReceiverSelected}"
+                Background="{DynamicResource PanelBackgroundBrush}"
+                BorderBrush="{DynamicResource PanelBorderBrush}"
+                BorderThickness="1"
+                CornerRadius="4"
+                Padding="10"
+                Width="188">
+            <StackPanel Spacing="8">
+                <TextBlock Text="Szerver IP"
+                           FontWeight="Bold" />
+                <TextBox Text="{Binding ReceiverHostIp, Mode=TwoWay}" />
+                <TextBlock Text="Kézi csatlakozás, ha az automatikus keresés nem működik."
+                           Foreground="{DynamicResource TextMutedBrush}"
                            TextWrapping="Wrap" />
-            </ScrollViewer>
-        </StackPanel>
-    </StackPanel>
+            </StackPanel>
+        </Border>
+    </Grid>
 </Window>
+
+
+

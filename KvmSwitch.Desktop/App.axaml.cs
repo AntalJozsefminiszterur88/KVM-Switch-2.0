@@ -1,11 +1,14 @@
 using System;
 using System.Linq;
 using Avalonia;
+using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Data.Core;
 using Avalonia.Data.Core.Plugins;
 using Avalonia.Markup.Xaml;
+using Avalonia.Threading;
 using KvmSwitch.Core.Interfaces;
+using KvmSwitch.Desktop.Services;
 using KvmSwitch.Desktop.ViewModels;
 using KvmSwitch.Desktop.Views;
 using KvmSwitch.Infrastructure.Services;
@@ -40,6 +43,56 @@ public partial class App : Application
         base.OnFrameworkInitializationCompleted();
     }
 
+    private void TrayIcon_OnClicked(object? sender, EventArgs e)
+    {
+        Dispatcher.UIThread.Post(ToggleMainWindow);
+    }
+
+    private void TrayIcon_ToggleWindow(object? sender, EventArgs e)
+    {
+        Dispatcher.UIThread.Post(ToggleMainWindow);
+    }
+
+    private void TrayIcon_Exit(object? sender, EventArgs e)
+    {
+        Dispatcher.UIThread.Post(ShutdownApplication);
+    }
+
+    private void ToggleMainWindow()
+    {
+        if (ApplicationLifetime is not IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            return;
+        }
+
+        var window = desktop.MainWindow;
+        if (window is null)
+        {
+            return;
+        }
+
+        if (window.IsVisible && window.WindowState != WindowState.Minimized)
+        {
+            window.Hide();
+            return;
+        }
+
+        window.Show();
+        window.WindowState = WindowState.Normal;
+        window.Activate();
+    }
+
+    private void ShutdownApplication()
+    {
+        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            desktop.Shutdown();
+            return;
+        }
+
+        Environment.Exit(0);
+    }
+
     private static ServiceProvider ConfigureServices()
     {
         Log.Logger = new LoggerConfiguration()
@@ -54,6 +107,9 @@ public partial class App : Application
 
         services.AddSingleton<IInputService, SharpHookInputService>();
         services.AddSingleton<INetworkService, TcpNetworkService>();
+        services.AddSingleton<ISerialService, PicoSerialService>();
+        services.AddSingleton<IMonitorControlService, WindowsMonitorControlService>();
+        services.AddSingleton<IScreenService, ScreenService>();
 
         services.AddSingleton<MainWindowViewModel>();
         services.AddSingleton<MainWindow>();
@@ -73,4 +129,5 @@ public partial class App : Application
             BindingPlugins.DataValidators.Remove(plugin);
         }
     }
+
 }

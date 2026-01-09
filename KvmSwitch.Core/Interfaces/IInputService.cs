@@ -5,6 +5,7 @@ namespace KvmSwitch.Core.Interfaces
 {
     public interface IInputService
     {
+        void SetPointerBounds(int width, int height);
         void Start();
         void Stop();
         void SimulateInput(InputEvent inputEvent);

@@ -12,10 +12,38 @@ namespace KvmSwitch.Infrastructure.Services
     {
         private readonly object _sync = new();
         private readonly EventSimulator _eventSimulator = new();
-        private TaskPoolGlobalHook? _hook;
+        private SimpleGlobalHook? _hook;
         private Task? _hookTask;
+        private volatile bool _suppressLocalInput = true;
+        private int _centerX;
+        private int _centerY;
+        private int _lastX;
+        private int _lastY;
+        private bool _centerInitialized;
+        private bool _isResettingPosition;
+        private int? _boundsWidth;
+        private int? _boundsHeight;
 
         public event EventHandler<InputEvent>? InputReceived;
+
+        public void SetPointerBounds(int width, int height)
+        {
+            if (width <= 0 || height <= 0)
+            {
+                _boundsWidth = null;
+                _boundsHeight = null;
+                _centerInitialized = false;
+                return;
+            }
+
+            _boundsWidth = width;
+            _boundsHeight = height;
+            InitializeCenterFromBounds();
+            if (_suppressLocalInput)
+            {
+                LockPointerToCenter();
+            }
+        }
 
         public void Start()
         {
@@ -28,14 +56,19 @@ namespace KvmSwitch.Infrastructure.Services
 
                 try
                 {
-                    _hook = new TaskPoolGlobalHook();
+                    _hook = new SimpleGlobalHook(runAsyncOnBackgroundThread: true);
                     _hook.KeyPressed += OnKeyPressed;
                     _hook.KeyReleased += OnKeyReleased;
                     _hook.MouseMoved += OnMouseMoved;
+                    _hook.MouseDragged += OnMouseDragged;
                     _hook.MousePressed += OnMousePressed;
                     _hook.MouseReleased += OnMouseReleased;
                     _hook.MouseWheel += OnMouseWheel;
 
+                    _suppressLocalInput = true;
+                    ResetCaptureState();
+                    InitializeCenterFromBounds();
+                    LockPointerToCenter();
                     _hookTask = _hook.RunAsync();
                     _hookTask.ContinueWith(
                         t => Log.Error(t.Exception, "SharpHook input hook terminated with an error."),
@@ -65,6 +98,8 @@ namespace KvmSwitch.Infrastructure.Services
                     _hook.Dispose();
                     _hook = null;
                     _hookTask = null;
+                    _suppressLocalInput = false;
+                    ResetCaptureState();
                     Log.Information("SharpHook input service stopped.");
                 }
                 catch (Exception ex)
@@ -115,6 +150,7 @@ namespace KvmSwitch.Infrastructure.Services
 
         private void OnKeyPressed(object? sender, KeyboardHookEventArgs e)
         {
+            SuppressIfNeeded(e);
             RaiseInputReceived(new InputEvent
             {
                 EventType = InputEventType.KeyDown,
@@ -124,6 +160,7 @@ namespace KvmSwitch.Infrastructure.Services
 
         private void OnKeyReleased(object? sender, KeyboardHookEventArgs e)
         {
+            SuppressIfNeeded(e);
             RaiseInputReceived(new InputEvent
             {
                 EventType = InputEventType.KeyUp,
@@ -133,6 +170,139 @@ namespace KvmSwitch.Infrastructure.Services
 
         private void OnMouseMoved(object? sender, MouseHookEventArgs e)
         {
+            HandleMouseMove(e);
+        }
+
+        private void OnMouseDragged(object? sender, MouseHookEventArgs e)
+        {
+            HandleMouseMove(e);
+        }
+
+        private void OnMousePressed(object? sender, MouseHookEventArgs e)
+        {
+            if (_suppressLocalInput)
+            {
+                e.SuppressEvent = true;
+                if (e.IsEventSimulated)
+                {
+                    return;
+                }
+            }
+            else
+            {
+                SuppressIfNeeded(e);
+            }
+
+            RaiseInputReceived(new InputEvent
+            {
+                EventType = InputEventType.MouseDown,
+                MouseButton = (int)e.Data.Button
+            });
+        }
+
+        private void OnMouseReleased(object? sender, MouseHookEventArgs e)
+        {
+            if (_suppressLocalInput)
+            {
+                e.SuppressEvent = true;
+                if (e.IsEventSimulated)
+                {
+                    return;
+                }
+            }
+            else
+            {
+                SuppressIfNeeded(e);
+            }
+
+            RaiseInputReceived(new InputEvent
+            {
+                EventType = InputEventType.MouseUp,
+                MouseButton = (int)e.Data.Button
+            });
+        }
+
+        private void OnMouseWheel(object? sender, MouseWheelHookEventArgs e)
+        {
+            if (_suppressLocalInput)
+            {
+                e.SuppressEvent = true;
+                if (e.IsEventSimulated)
+                {
+                    return;
+                }
+            }
+            else
+            {
+                SuppressIfNeeded(e);
+            }
+
+            RaiseInputReceived(new InputEvent
+            {
+                EventType = InputEventType.MouseWheel,
+                MouseButton = e.Data.Rotation
+            });
+        }
+
+        private void RaiseInputReceived(InputEvent inputEvent)
+        {
+            InputReceived?.Invoke(this, inputEvent);
+        }
+
+        private void SuppressIfNeeded(HookEventArgs e)
+        {
+            if (!_suppressLocalInput || e.IsEventSimulated)
+            {
+                return;
+            }
+
+            e.SuppressEvent = true;
+        }
+
+        private void HandleMouseMove(MouseHookEventArgs e)
+        {
+            if (_suppressLocalInput)
+            {
+                e.SuppressEvent = true;
+
+                if (_isResettingPosition && e.IsEventSimulated)
+                {
+                    _isResettingPosition = false;
+                    return;
+                }
+
+                if (e.IsEventSimulated)
+                {
+                    return;
+                }
+
+                if (_isResettingPosition)
+                {
+                    _isResettingPosition = false;
+                }
+
+                EnsureCenterInitialized(e.Data.X, e.Data.Y);
+
+                var deltaX = e.Data.X - _lastX;
+                var deltaY = e.Data.Y - _lastY;
+                if (deltaX == 0 && deltaY == 0)
+                {
+                    return;
+                }
+
+                RaiseInputReceived(new InputEvent
+                {
+                    EventType = InputEventType.MouseMove,
+                    MouseX = deltaX,
+                    MouseY = deltaY,
+                    IsRelative = true
+                });
+
+                LockPointerToCenter();
+                return;
+            }
+
+            SuppressIfNeeded(e);
             RaiseInputReceived(new InputEvent
             {
                 EventType = InputEventType.MouseMove,
@@ -141,42 +311,74 @@ namespace KvmSwitch.Infrastructure.Services
             });
         }
 
-        private void OnMousePressed(object? sender, MouseHookEventArgs e)
+        private void ResetCaptureState()
         {
-            RaiseInputReceived(new InputEvent
-            {
-                EventType = InputEventType.MouseDown,
-                MouseX = e.Data.X,
-                MouseY = e.Data.Y,
-                MouseButton = (int)e.Data.Button
-            });
+            _centerInitialized = false;
+            _isResettingPosition = false;
+            _centerX = 0;
+            _centerY = 0;
+            _lastX = 0;
+            _lastY = 0;
         }
 
-        private void OnMouseReleased(object? sender, MouseHookEventArgs e)
+        private void InitializeCenterFromBounds()
         {
-            RaiseInputReceived(new InputEvent
+            if (_boundsWidth is not { } width || _boundsHeight is not { } height)
             {
-                EventType = InputEventType.MouseUp,
-                MouseX = e.Data.X,
-                MouseY = e.Data.Y,
-                MouseButton = (int)e.Data.Button
-            });
+                return;
+            }
+
+            if (width <= 0 || height <= 0)
+            {
+                return;
+            }
+
+            _centerX = width / 2;
+            _centerY = height / 2;
+            _lastX = _centerX;
+            _lastY = _centerY;
+            _centerInitialized = true;
         }
 
-        private void OnMouseWheel(object? sender, MouseWheelHookEventArgs e)
+        private void EnsureCenterInitialized(int fallbackX, int fallbackY)
         {
-            RaiseInputReceived(new InputEvent
+            if (_centerInitialized)
             {
-                EventType = InputEventType.MouseWheel,
-                MouseX = e.Data.X,
-                MouseY = e.Data.Y,
-                MouseButton = e.Data.Rotation
-            });
+                return;
+            }
+
+            InitializeCenterFromBounds();
+            if (_centerInitialized)
+            {
+                return;
+            }
+
+            _centerX = fallbackX;
+            _centerY = fallbackY;
+            _lastX = _centerX;
+            _lastY = _centerY;
+            _centerInitialized = true;
         }
 
-        private void RaiseInputReceived(InputEvent inputEvent)
+        private void LockPointerToCenter()
         {
-            InputReceived?.Invoke(this, inputEvent);
+            if (!_centerInitialized)
+            {
+                return;
+            }
+
+            _lastX = _centerX;
+            _lastY = _centerY;
+            _isResettingPosition = true;
+            try
+            {
+                _eventSimulator.SimulateMouseMovement((short)_centerX, (short)_centerY);
+            }
+            catch (Exception ex)
+            {
+                _isResettingPosition = false;
+                Log.Warning(ex, "Failed to lock mouse position.");
+            }
         }
     }
 }

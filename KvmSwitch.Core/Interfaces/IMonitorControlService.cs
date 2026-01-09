@@ -5,5 +5,6 @@ namespace KvmSwitch.Core.Interfaces
     public interface IMonitorControlService
     {
         Task SwitchInputAsync(int inputSourceId);
+        Task TogglePowerAsync();
     }
 }

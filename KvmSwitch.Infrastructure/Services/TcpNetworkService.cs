@@ -1,10 +1,15 @@
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using KvmSwitch.Core.Interfaces;
+using Makaretu.Dns;
 using MessagePack;
 using MessagePack.Resolvers;
 using Serilog;
@@ -13,130 +18,160 @@ namespace KvmSwitch.Infrastructure.Services
 {
     public sealed class TcpNetworkService : INetworkService
     {
+        private sealed class ClientConnection : IDisposable
+        {
+            public ClientConnection(TcpClient client)
+            {
+                Client = client;
+                Stream = client.GetStream();
+            }
+
+            public TcpClient Client { get; }
+            public NetworkStream Stream { get; }
+            public SemaphoreSlim WriteLock { get; } = new(1, 1);
+
+            public void Dispose()
+            {
+                Stream.Dispose();
+                Client.Close();
+                WriteLock.Dispose();
+            }
+        }
+
         private static readonly MessagePackSerializerOptions SerializerOptions =
             MessagePackSerializerOptions.Standard.WithResolver(TypelessContractlessStandardResolver.Instance);
+        private const string ServiceType = "_kvmswitch._tcp";
+        private const string ServiceInstanceName = "kvmcontroller";
+        private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
+        private static readonly DomainName ServiceTypeName = new(ServiceType);
 
+        private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
         private readonly object _sync = new();
-        private readonly SemaphoreSlim _writeLock = new(1, 1);
         private TcpListener? _listener;
-        private TcpClient? _client;
-        private NetworkStream? _stream;
-        private CancellationTokenSource? _connectionCts;
-        private Task? _receiveTask;
+        private CancellationTokenSource? _cts;
+        private Task? _acceptTask;
+        private Task? _clientLoopTask;
+        private ServiceDiscovery? _serviceDiscovery;
+        private ServiceProfile? _serviceProfile;
+        private int _connectionInProgress;
         private volatile bool _isConnected;
+        private volatile bool _isServer;
 
-        public event EventHandler<object>? MessageReceived;
+        public event EventHandler<(object Message, Guid ClientId)>? MessageReceived;
+        public event EventHandler<Guid>? ClientConnected;
+        public event EventHandler<Guid>? ClientDisconnected;
 
+        public int Port { get; set; } = 65432;
         public bool IsConnected => _isConnected;
+        public bool IsServer => _isServer;
 
-        public async Task StartServerAsync(int port)
+        public Task StartServerAsync()
         {
-            TcpListener? listener;
-            CancellationTokenSource? cts;
-
             lock (_sync)
             {
-                if (_listener != null || _client != null)
+                if (_listener != null)
                 {
-                    Log.Warning("TCP server already running.");
-                    return;
+                    if (IsListenerActive(_listener))
+                    {
+                        Log.Warning("TCP server already running.");
+                        return Task.CompletedTask;
+                    }
+
+                    if (!_clients.IsEmpty)
+                    {
+                        Log.Warning("TCP service already has active connections.");
+                        return Task.CompletedTask;
+                    }
+
+                    ResetServerState();
                 }
 
-                _listener = new TcpListener(IPAddress.Any, port);
-                _listener.Start();
-                _connectionCts = new CancellationTokenSource();
-                listener = _listener;
-                cts = _connectionCts;
+                if (!_clients.IsEmpty)
+                {
+                    Log.Warning("TCP service already has active connections.");
+                    return Task.CompletedTask;
+                }
+
+                _cts = new CancellationTokenSource();
+                _listener = new TcpListener(IPAddress.Any, Port);
+                try
+                {
+                    _listener.Start();
+                }
+                catch
+                {
+                    ResetServerState();
+                    throw;
+                }
+                _isServer = true;
+                _acceptTask = Task.Run(() => AcceptLoopAsync(_listener, _cts.Token));
+                StartServiceAdvertisement();
             }
 
-            Log.Information("TCP server listening on port {Port}.", port);
-
-            try
-            {
-                var client = await listener.AcceptTcpClientAsync(cts.Token).ConfigureAwait(false);
-                client.NoDelay = true;
-                InitializeConnection(client, cts.Token, "server accept");
-            }
-            catch (OperationCanceledException)
-            {
-                Log.Information("TCP server accept canceled.");
-            }
-            catch (ObjectDisposedException)
-            {
-                Log.Information("TCP server listener disposed.");
-            }
-            catch (Exception ex)
-            {
-                Log.Error(ex, "TCP server failed while accepting a client.");
-                throw;
-            }
+            Log.Information("TCP server listening on port {Port}.", Port);
+            return Task.CompletedTask;
         }
 
-        public async Task ConnectToClientAsync(string ip, int port)
+        public Task StartClientAsync()
         {
-            if (string.IsNullOrWhiteSpace(ip))
-            {
-                throw new ArgumentException("IP address is required.", nameof(ip));
-            }
+            return StartClientAsync(null);
+        }
 
-            CancellationTokenSource? cts;
-
+        public Task StartClientAsync(string? hostAddress)
+        {
             lock (_sync)
             {
-                if (_listener != null || _client != null)
+                if (_listener != null)
                 {
-                    Log.Warning("TCP client already connected or server running.");
-                    return;
+                    Log.Warning("TCP service is already running as a server.");
+                    return Task.CompletedTask;
                 }
 
-                _connectionCts = new CancellationTokenSource();
-                cts = _connectionCts;
-            }
+                if (_cts != null || !_clients.IsEmpty)
+                {
+                    Log.Warning("TCP client already running.");
+                    return Task.CompletedTask;
+                }
 
-            var client = new TcpClient { NoDelay = true };
+                _cts = new CancellationTokenSource();
+                _isServer = false;
 
-            try
-            {
-                await client.ConnectAsync(ip, port, cts.Token).ConfigureAwait(false);
-                InitializeConnection(client, cts.Token, "client connect");
+                if (string.IsNullOrWhiteSpace(hostAddress))
+                {
+                    _serviceDiscovery = new ServiceDiscovery();
+                    _serviceDiscovery.ServiceInstanceDiscovered += OnServiceInstanceDiscovered;
+                    try
+                    {
+                        _serviceDiscovery.QueryServiceInstances(ServiceTypeName);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warning(ex, "Service discovery query failed.");
+                    }
+
+                    _clientLoopTask = Task.Run(() => ClientLoopAsync(_cts.Token));
+                    Log.Information("TCP client auto-discovery started.");
+                    return Task.CompletedTask;
+                }
+
+                var targetHost = hostAddress.Trim();
+                _clientLoopTask = Task.Run(() => DirectConnectLoopAsync(targetHost, _cts.Token));
+                Log.Information("TCP client direct connect started to {Host}:{Port}.", targetHost, Port);
             }
-            catch (OperationCanceledException)
-            {
-                Log.Information("TCP client connection canceled.");
-                client.Close();
-            }
-            catch (Exception ex)
-            {
-                Log.Error(ex, "TCP client failed to connect to {Ip}:{Port}.", ip, port);
-                client.Close();
-                throw;
-            }
+            return Task.CompletedTask;
         }
 
-        public async Task SendAsync<T>(T message)
+        public async Task SendAsync<T>(T message, Guid? targetClientId = null)
         {
             if (message == null)
             {
                 throw new ArgumentNullException(nameof(message));
             }
 
-            NetworkStream stream;
-
-            lock (_sync)
-            {
-                if (!_isConnected || _stream == null)
-                {
-                    throw new InvalidOperationException("Not connected.");
-                }
-
-                stream = _stream;
-            }
-
             byte[] payload;
-
             try
             {
-                payload = MessagePackSerializer.Serialize(message, SerializerOptions);
+                payload = MessagePackSerializer.Serialize<object>(message, SerializerOptions);
             }
             catch (Exception ex)
             {
@@ -144,46 +179,58 @@ namespace KvmSwitch.Infrastructure.Services
                 throw;
             }
 
-            var lengthBytes = BitConverter.GetBytes(payload.Length);
+            if (targetClientId.HasValue)
+            {
+                if (_clients.TryGetValue(targetClientId.Value, out var connection))
+                {
+                    await SendToConnectionAsync(targetClientId.Value, connection, payload).ConfigureAwait(false);
+                }
+                else
+                {
+                    Log.Warning("Target client {ClientId} not found.", targetClientId.Value);
+                }
 
-            await _writeLock.WaitAsync().ConfigureAwait(false);
-            try
-            {
-                await stream.WriteAsync(lengthBytes, 0, lengthBytes.Length).ConfigureAwait(false);
-                await stream.WriteAsync(payload, 0, payload.Length).ConfigureAwait(false);
-                await stream.FlushAsync().ConfigureAwait(false);
+                return;
             }
-            catch (Exception ex)
+
+            foreach (var kvp in _clients)
             {
-                Log.Error(ex, "Failed to send message.");
-                HandleDisconnect("Connection lost while sending.", ex);
-                throw;
-            }
-            finally
-            {
-                _writeLock.Release();
+                await SendToConnectionAsync(kvp.Key, kvp.Value, payload).ConfigureAwait(false);
             }
         }
 
         public void Stop()
         {
-            TcpListener? listener;
-            TcpClient? client;
-            NetworkStream? stream;
             CancellationTokenSource? cts;
+            TcpListener? listener;
+            ServiceDiscovery? serviceDiscovery;
 
             lock (_sync)
             {
+                cts = _cts;
+                _cts = null;
                 listener = _listener;
                 _listener = null;
-                client = _client;
-                _client = null;
-                stream = _stream;
-                _stream = null;
-                cts = _connectionCts;
-                _connectionCts = null;
-                _receiveTask = null;
-                _isConnected = false;
+                _acceptTask = null;
+                _clientLoopTask = null;
+                serviceDiscovery = _serviceDiscovery;
+                _serviceDiscovery = null;
+                _serviceProfile = null;
+                _isServer = false;
+                _connectionInProgress = 0;
+            }
+
+            if (serviceDiscovery != null)
+            {
+                try
+                {
+                    serviceDiscovery.ServiceInstanceDiscovered -= OnServiceInstanceDiscovered;
+                    serviceDiscovery.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "Error while stopping service discovery.");
+                }
             }
 
             try
@@ -193,25 +240,7 @@ namespace KvmSwitch.Infrastructure.Services
             }
             catch (Exception ex)
             {
-                Log.Warning(ex, "Error while cancelling TCP network service.");
-            }
-
-            try
-            {
-                stream?.Dispose();
-            }
-            catch (Exception ex)
-            {
-                Log.Warning(ex, "Error while disposing TCP network stream.");
-            }
-
-            try
-            {
-                client?.Close();
-            }
-            catch (Exception ex)
-            {
-                Log.Warning(ex, "Error while closing TCP client.");
+                Log.Warning(ex, "Error while stopping TCP service.");
             }
 
             try
@@ -223,26 +252,508 @@ namespace KvmSwitch.Infrastructure.Services
                 Log.Warning(ex, "Error while stopping TCP listener.");
             }
 
+            foreach (var clientId in _clients.Keys)
+            {
+                RemoveClient(clientId, "TCP service stopped.");
+            }
+
+            UpdateConnectionState();
             Log.Information("TCP network service stopped.");
         }
 
-        private void InitializeConnection(TcpClient client, CancellationToken token, string source)
+        private void ResetServerState()
         {
-            NetworkStream stream;
+            var cts = _cts;
+            _cts = null;
+            _listener = null;
+            _acceptTask = null;
+            _isServer = false;
 
-            lock (_sync)
+            if (cts == null)
             {
-                _client = client;
-                _stream = client.GetStream();
-                _isConnected = true;
-                stream = _stream;
+                return;
             }
 
-            Log.Information("TCP connection established via {Source} ({RemoteEndPoint}).", source, client.Client.RemoteEndPoint);
-            _receiveTask = ReceiveLoopAsync(stream, token);
+            try
+            {
+                cts.Cancel();
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Error while canceling TCP service startup.");
+            }
+
+            cts.Dispose();
         }
 
-        private async Task ReceiveLoopAsync(NetworkStream stream, CancellationToken token)
+        private static bool IsListenerActive(TcpListener listener)
+        {
+            try
+            {
+                return listener.Server.IsBound;
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
+            catch (SocketException)
+            {
+                return false;
+            }
+        }
+
+        private void StartServiceAdvertisement()
+        {
+            if (_serviceDiscovery != null)
+            {
+                return;
+            }
+
+            try
+            {
+                _serviceProfile = new ServiceProfile(
+                    new DomainName(ServiceInstanceName),
+                    ServiceTypeName,
+                    (ushort)Port,
+                    GetLocalAddresses());
+
+                _serviceDiscovery = new ServiceDiscovery();
+                _serviceDiscovery.Advertise(_serviceProfile);
+                Log.Information("mDNS service advertised as {Name} on port {Port}.", ServiceInstanceName, Port);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Failed to advertise mDNS service.");
+            }
+        }
+
+        private static IReadOnlyList<IPAddress> GetLocalAddresses()
+        {
+            var overrideIp = Environment.GetEnvironmentVariable("KVM_SWITCH_ADVERTISE_IP");
+            if (!string.IsNullOrWhiteSpace(overrideIp) && IPAddress.TryParse(overrideIp, out var parsedIp))
+            {
+                Log.Information("Using overridden advertise IP: {Ip}.", parsedIp);
+                return new[] { parsedIp };
+            }
+
+            var candidates = new List<(NetworkInterface Nic, IPAddress Ip, int Score)>();
+
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (!IsEligibleInterface(nic))
+                {
+                    continue;
+                }
+
+                var ipProps = nic.GetIPProperties();
+                var hasIpv4Gateway = ipProps.GatewayAddresses.Any(gateway =>
+                    gateway.Address.AddressFamily == AddressFamily.InterNetwork);
+
+                foreach (var unicast in ipProps.UnicastAddresses)
+                {
+                    var address = unicast.Address;
+                    if (!IsUsableIpv4(address))
+                    {
+                        continue;
+                    }
+
+                    var score = ScoreInterface(nic, address, hasIpv4Gateway);
+                    candidates.Add((nic, address, score));
+                }
+            }
+
+            if (candidates.Count == 0)
+            {
+                return Dns.GetHostAddresses(Dns.GetHostName())
+                    .Where(address => !IPAddress.IsLoopback(address))
+                    .Where(address => address.AddressFamily == AddressFamily.InterNetwork || address.AddressFamily == AddressFamily.InterNetworkV6)
+                    .Distinct()
+                    .ToArray();
+            }
+
+            var ordered = candidates.OrderByDescending(candidate => candidate.Score).ToList();
+            var selected = ordered[0];
+
+            if (ordered.Count > 1)
+            {
+                var candidateSummary = string.Join(", ", ordered.Select(candidate =>
+                    $"{candidate.Ip} ({candidate.Nic.Name}) score={candidate.Score}"));
+                Log.Information("Candidate advertise IPs: {Candidates}.", candidateSummary);
+            }
+
+            Log.Information("Selected advertise IP {Ip} from {Interface} ({Description}).",
+                selected.Ip, selected.Nic.Name, selected.Nic.Description);
+            return new[] { selected.Ip };
+        }
+
+        private static bool IsEligibleInterface(NetworkInterface nic)
+        {
+            if (nic.OperationalStatus != OperationalStatus.Up)
+            {
+                return false;
+            }
+
+            if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback
+                || nic.NetworkInterfaceType == NetworkInterfaceType.Tunnel
+                || nic.NetworkInterfaceType == NetworkInterfaceType.Unknown)
+            {
+                return false;
+            }
+
+            return !IsDisallowedInterface(nic.Name, nic.Description);
+        }
+
+        private static bool IsDisallowedInterface(string? name, string? description)
+        {
+            var combined = $"{name} {description}".ToLowerInvariant();
+            string[] tokens =
+            {
+                "virtual",
+                "hyper-v",
+                "wsl",
+                "vmware",
+                "vbox",
+                "docker",
+                "tunnel",
+                "teredo",
+                "vpn",
+                "wireguard",
+                "zerotier",
+                "tailscale",
+                "hamachi",
+                "bluetooth"
+            };
+
+            return tokens.Any(token => combined.Contains(token, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool IsUsableIpv4(IPAddress address)
+        {
+            if (address.AddressFamily != AddressFamily.InterNetwork)
+            {
+                return false;
+            }
+
+            if (IPAddress.IsLoopback(address))
+            {
+                return false;
+            }
+
+            var bytes = address.GetAddressBytes();
+            if (bytes[0] == 169 && bytes[1] == 254)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private static int ScoreInterface(NetworkInterface nic, IPAddress address, bool hasIpv4Gateway)
+        {
+            var score = 0;
+            if (hasIpv4Gateway)
+            {
+                score += 100;
+            }
+
+            if (IsPrivateIpv4(address))
+            {
+                score += 50;
+            }
+
+            if (nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet)
+            {
+                score += 30;
+            }
+            else if (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211)
+            {
+                score += 20;
+            }
+
+            return score;
+        }
+
+        private static bool IsPrivateIpv4(IPAddress address)
+        {
+            var bytes = address.GetAddressBytes();
+            return bytes[0] == 10
+                || (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31)
+                || (bytes[0] == 192 && bytes[1] == 168);
+        }
+
+        private async Task ClientLoopAsync(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    var discovery = _serviceDiscovery;
+                    if (discovery != null)
+                    {
+                        discovery.QueryServiceInstances(ServiceTypeName);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "Service discovery query failed.");
+                }
+
+                await Task.Delay(ReconnectDelay, token).ConfigureAwait(false);
+            }
+        }
+
+        private async Task DirectConnectLoopAsync(string hostAddress, CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                if (IsConnected)
+                {
+                    try
+                    {
+                        await Task.Delay(ReconnectDelay, token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                try
+                {
+                    var receiveTask = await ConnectAsync(hostAddress, Port, token).ConfigureAwait(false);
+                    if (receiveTask != null)
+                    {
+                        await receiveTask.ConfigureAwait(false);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "Direct connect failed to {Host}:{Port}.", hostAddress, Port);
+                }
+
+                try
+                {
+                    await Task.Delay(ReconnectDelay, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+
+        private void OnServiceInstanceDiscovered(object? sender, ServiceInstanceDiscoveryEventArgs e)
+        {
+            if (!IsMatchingServiceInstance(e.ServiceInstanceName))
+            {
+                return;
+            }
+
+            var tokenSource = _cts;
+            if (tokenSource == null || tokenSource.IsCancellationRequested || IsConnected)
+            {
+                return;
+            }
+
+            if (!TryResolveEndpoint(e, out var address, out var port))
+            {
+                return;
+            }
+
+            _ = Task.Run(() => ConnectToDiscoveredServiceAsync(address, port, tokenSource.Token), tokenSource.Token);
+        }
+
+        private async Task ConnectToDiscoveredServiceAsync(IPAddress address, int port, CancellationToken token)
+        {
+            if (Interlocked.Exchange(ref _connectionInProgress, 1) == 1)
+            {
+                return;
+            }
+
+            try
+            {
+                if (token.IsCancellationRequested || IsConnected)
+                {
+                    return;
+                }
+
+                var receiveTask = await ConnectAsync(address.ToString(), port, token).ConfigureAwait(false);
+                if (receiveTask != null)
+                {
+                    await receiveTask.ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _connectionInProgress, 0);
+            }
+        }
+
+        private static bool IsMatchingServiceInstance(DomainName instanceName)
+        {
+            var name = instanceName.ToString().TrimEnd('.');
+            if (!name.StartsWith(ServiceInstanceName + ".", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return name.IndexOf(ServiceType, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private bool TryResolveEndpoint(ServiceInstanceDiscoveryEventArgs e, out IPAddress address, out int port)
+        {
+            address = IPAddress.None;
+            port = 0;
+
+            var records = EnumerateRecords(e.Message).ToList();
+            var srvRecord = records
+                .OfType<SRVRecord>()
+                .FirstOrDefault(record => DomainNameEquals(record.Name, e.ServiceInstanceName));
+
+            DomainName? target = null;
+            if (srvRecord != null)
+            {
+                port = srvRecord.Port;
+                target = srvRecord.Target;
+            }
+            else
+            {
+                port = Port;
+            }
+
+            var addresses = new List<IPAddress>();
+
+            if (target != null)
+            {
+                addresses.AddRange(records
+                    .OfType<ARecord>()
+                    .Where(record => DomainNameEquals(record.Name, target))
+                    .Select(record => record.Address));
+
+                addresses.AddRange(records
+                    .OfType<AAAARecord>()
+                    .Where(record => DomainNameEquals(record.Name, target))
+                    .Select(record => record.Address));
+            }
+
+            if (addresses.Count == 0 && e.RemoteEndPoint != null)
+            {
+                addresses.Add(e.RemoteEndPoint.Address);
+            }
+
+            var selected = SelectAddress(addresses);
+            if (selected == null || port <= 0)
+            {
+                return false;
+            }
+
+            address = selected;
+            return true;
+        }
+
+        private static IEnumerable<ResourceRecord> EnumerateRecords(Message message)
+        {
+            foreach (var record in message.Answers)
+            {
+                yield return record;
+            }
+
+            foreach (var record in message.AdditionalRecords)
+            {
+                yield return record;
+            }
+
+            foreach (var record in message.AuthorityRecords)
+            {
+                yield return record;
+            }
+        }
+
+        private static bool DomainNameEquals(DomainName? left, DomainName? right)
+        {
+            return left != null && right != null && left.Equals(right);
+        }
+
+        private static IPAddress? SelectAddress(IEnumerable<IPAddress> addresses)
+        {
+            var addressList = addresses as IList<IPAddress> ?? addresses.ToList();
+            return addressList.FirstOrDefault(candidate => candidate.AddressFamily == AddressFamily.InterNetwork)
+                ?? addressList.FirstOrDefault();
+        }
+
+        private async Task<Task?> ConnectAsync(string ip, int port, CancellationToken token)
+        {
+            var client = new TcpClient { NoDelay = true };
+
+            try
+            {
+                await client.ConnectAsync(ip, port, token).ConfigureAwait(false);
+                AddClient(Guid.Empty, client);
+
+                if (!_clients.TryGetValue(Guid.Empty, out var connection))
+                {
+                    client.Close();
+                    return null;
+                }
+
+                var receiveTask = ReceiveLoopAsync(Guid.Empty, connection, token);
+                Log.Information("TCP client connected to {Ip}:{Port}.", ip, port);
+                return receiveTask;
+            }
+            catch (OperationCanceledException)
+            {
+                Log.Information("TCP client connection canceled.");
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "TCP client failed to connect to {Ip}:{Port}.", ip, port);
+            }
+
+            client.Close();
+            return null;
+        }
+
+        private async Task AcceptLoopAsync(TcpListener listener, CancellationToken token)
+        {
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    var client = await listener.AcceptTcpClientAsync(token).ConfigureAwait(false);
+                    client.NoDelay = true;
+                    var clientId = Guid.NewGuid();
+
+                    AddClient(clientId, client);
+                    _ = ReceiveLoopAsync(clientId, _clients[clientId], token);
+
+                    Log.Information("TCP client connected: {ClientId}.", clientId);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                Log.Information("TCP accept loop canceled.");
+            }
+            catch (ObjectDisposedException)
+            {
+                Log.Information("TCP listener disposed.");
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "TCP accept loop failed.");
+            }
+        }
+
+        private async Task ReceiveLoopAsync(Guid clientId, ClientConnection connection, CancellationToken token)
         {
             try
             {
@@ -250,23 +761,23 @@ namespace KvmSwitch.Infrastructure.Services
 
                 while (!token.IsCancellationRequested)
                 {
-                    if (!await ReadExactAsync(stream, lengthBuffer, token).ConfigureAwait(false))
+                    if (!await ReadExactAsync(connection.Stream, lengthBuffer, token).ConfigureAwait(false))
                     {
-                        HandleDisconnect("Remote connection closed.");
+                        RemoveClient(clientId, "Remote connection closed.");
                         return;
                     }
 
                     int length = BitConverter.ToInt32(lengthBuffer, 0);
                     if (length <= 0)
                     {
-                        HandleDisconnect("Invalid message length received.");
+                        RemoveClient(clientId, "Invalid message length received.");
                         return;
                     }
 
                     var payload = new byte[length];
-                    if (!await ReadExactAsync(stream, payload, token).ConfigureAwait(false))
+                    if (!await ReadExactAsync(connection.Stream, payload, token).ConfigureAwait(false))
                     {
-                        HandleDisconnect("Remote connection closed while reading payload.");
+                        RemoveClient(clientId, "Remote connection closed while reading payload.");
                         return;
                     }
 
@@ -277,33 +788,97 @@ namespace KvmSwitch.Infrastructure.Services
                     }
                     catch (Exception ex)
                     {
-                        Log.Error(ex, "Failed to deserialize incoming message.");
+                        Log.Error(ex, "Failed to deserialize incoming message from {ClientId}.", clientId);
                         continue;
                     }
 
                     if (message != null)
                     {
-                        MessageReceived?.Invoke(this, message);
+                        MessageReceived?.Invoke(this, (message, clientId));
                     }
                 }
             }
             catch (OperationCanceledException)
             {
-                Log.Information("TCP receive loop canceled.");
+                Log.Information("TCP receive loop canceled for {ClientId}.", clientId);
             }
             catch (IOException ex)
             {
-                HandleDisconnect("TCP receive loop aborted due to IO error.", ex);
+                RemoveClient(clientId, "TCP receive loop aborted due to IO error.", ex);
             }
             catch (SocketException ex)
             {
-                HandleDisconnect("TCP receive loop aborted due to socket error.", ex);
+                RemoveClient(clientId, "TCP receive loop aborted due to socket error.", ex);
             }
             catch (Exception ex)
             {
-                Log.Error(ex, "Unexpected error in TCP receive loop.");
-                HandleDisconnect("TCP receive loop terminated unexpectedly.", ex);
+                RemoveClient(clientId, "Unexpected error in TCP receive loop.", ex);
             }
+        }
+
+        private async Task SendToConnectionAsync(Guid clientId, ClientConnection connection, byte[] payload)
+        {
+            var lengthBytes = BitConverter.GetBytes(payload.Length);
+
+            await connection.WriteLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await connection.Stream.WriteAsync(lengthBytes, 0, lengthBytes.Length).ConfigureAwait(false);
+                await connection.Stream.WriteAsync(payload, 0, payload.Length).ConfigureAwait(false);
+                await connection.Stream.FlushAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                RemoveClient(clientId, "Failed to send message.", ex);
+            }
+            finally
+            {
+                connection.WriteLock.Release();
+            }
+        }
+
+        private void AddClient(Guid clientId, TcpClient client)
+        {
+            var connection = new ClientConnection(client);
+            if (_clients.TryAdd(clientId, connection))
+            {
+                UpdateConnectionState();
+                ClientConnected?.Invoke(this, clientId);
+            }
+        }
+
+        private void RemoveClient(Guid clientId, string message, Exception? ex = null)
+        {
+            if (!_clients.TryRemove(clientId, out var connection))
+            {
+                return;
+            }
+
+            if (ex == null)
+            {
+                Log.Warning("{Message} ClientId={ClientId}", message, clientId);
+            }
+            else
+            {
+                Log.Warning(ex, "{Message} ClientId={ClientId}", message, clientId);
+            }
+
+            try
+            {
+                connection.Dispose();
+            }
+            catch (Exception disposeEx)
+            {
+                Log.Warning(disposeEx, "Error while disposing TCP client {ClientId}.", clientId);
+            }
+
+            UpdateConnectionState();
+            ClientDisconnected?.Invoke(this, clientId);
+        }
+
+        private void UpdateConnectionState()
+        {
+            _isConnected = !_clients.IsEmpty;
         }
 
         private static async Task<bool> ReadExactAsync(NetworkStream stream, byte[] buffer, CancellationToken token)
@@ -321,48 +896,6 @@ namespace KvmSwitch.Infrastructure.Services
             }
 
             return true;
-        }
-
-        private void HandleDisconnect(string message, Exception? ex = null)
-        {
-            if (ex == null)
-            {
-                Log.Warning(message);
-            }
-            else
-            {
-                Log.Warning(ex, message);
-            }
-
-            TcpClient? client;
-            NetworkStream? stream;
-
-            lock (_sync)
-            {
-                client = _client;
-                _client = null;
-                stream = _stream;
-                _stream = null;
-                _isConnected = false;
-            }
-
-            try
-            {
-                stream?.Dispose();
-            }
-            catch (Exception disposeEx)
-            {
-                Log.Warning(disposeEx, "Error while disposing TCP network stream.");
-            }
-
-            try
-            {
-                client?.Close();
-            }
-            catch (Exception closeEx)
-            {
-                Log.Warning(closeEx, "Error while closing TCP client.");
-            }
         }
     }
 }
