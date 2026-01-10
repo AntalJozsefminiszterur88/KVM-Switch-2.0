@@ -1,0 +1,194 @@
+﻿<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:vm="using:KvmSwitch.Desktop.ViewModels"
+        mc:Ignorable="d"
+        x:Class="KvmSwitch.Desktop.Views.FileTransferWindow"
+        x:DataType="vm:FileTransferViewModel"
+        Width="1000"
+        Height="720"
+        MinWidth="900"
+        MinHeight="640"
+        WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource AppBackgroundBrush}"
+        Foreground="{DynamicResource TextPrimaryBrush}"
+        Icon="/Assets/logo.ico"
+        Title="LAN fájlátvitel">
+
+    <Window.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Light">
+                    <Color x:Key="AppBackgroundColor">#F5F6F8</Color>
+                    <Color x:Key="PanelBackgroundColor">#FFFFFF</Color>
+                    <Color x:Key="PanelBorderColor">#E1E4E8</Color>
+                    <Color x:Key="TextPrimaryColor">#1F2937</Color>
+                    <Color x:Key="TextMutedColor">#4B5563</Color>
+                    <Color x:Key="AccentColor">#3F51B5</Color>
+                    <Color x:Key="AccentForegroundColor">#FFFFFF</Color>
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Dark">
+                    <Color x:Key="AppBackgroundColor">#1E1E1E</Color>
+                    <Color x:Key="PanelBackgroundColor">#252526</Color>
+                    <Color x:Key="PanelBorderColor">#2C2C2C</Color>
+                    <Color x:Key="TextPrimaryColor">#E0E0E0</Color>
+                    <Color x:Key="TextMutedColor">#B0B0B0</Color>
+                    <Color x:Key="AccentColor">#3F51B5</Color>
+                    <Color x:Key="AccentForegroundColor">#FFFFFF</Color>
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+
+            <SolidColorBrush x:Key="AppBackgroundBrush" Color="{DynamicResource AppBackgroundColor}" />
+            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="{DynamicResource PanelBackgroundColor}" />
+            <SolidColorBrush x:Key="PanelBorderBrush" Color="{DynamicResource PanelBorderColor}" />
+            <SolidColorBrush x:Key="TextPrimaryBrush" Color="{DynamicResource TextPrimaryColor}" />
+            <SolidColorBrush x:Key="TextMutedBrush" Color="{DynamicResource TextMutedColor}" />
+            <SolidColorBrush x:Key="AccentBrush" Color="{DynamicResource AccentColor}" />
+            <SolidColorBrush x:Key="AccentForegroundBrush" Color="{DynamicResource AccentForegroundColor}" />
+        </ResourceDictionary>
+    </Window.Resources>
+
+    <Grid RowDefinitions="Auto,*" ColumnDefinitions="*" Margin="16" RowSpacing="12">
+        <Border Grid.Row="0"
+                Background="{DynamicResource PanelBackgroundBrush}"
+                BorderBrush="{DynamicResource PanelBorderBrush}"
+                BorderThickness="1"
+                CornerRadius="4"
+                Padding="10">
+            <Grid ColumnDefinitions="Auto,*" ColumnSpacing="12" VerticalAlignment="Center">
+                <Button Content="Vissza" Command="{Binding BackCommand}" />
+                <StackPanel Grid.Column="1" Spacing="2">
+                    <TextBlock Text="LAN fájlátvitel" FontWeight="Bold" FontSize="16" />
+                    <TextBlock Text="Fájlok küldése helyi hálózaton (port: 54546)."
+                               Foreground="{DynamicResource TextMutedBrush}" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1" ColumnDefinitions="220,*" ColumnSpacing="12">
+            <Border Background="{DynamicResource PanelBackgroundBrush}"
+                    BorderBrush="{DynamicResource PanelBorderBrush}"
+                    BorderThickness="1"
+                    CornerRadius="4"
+                    Padding="10">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="LAN Drop" FontWeight="Bold" FontSize="18" />
+                    <TextBlock Text="Egyszerű LAN fájlátvitel" Foreground="{DynamicResource TextMutedBrush}" TextWrapping="Wrap" />
+                    <TextBlock Text="Port: 54546" FontWeight="SemiBold" />
+                    <TextBlock Text="Használd a jobb oldali gombokat a fogadáshoz vagy küldéshez." TextWrapping="Wrap" />
+                </StackPanel>
+            </Border>
+
+            <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto">
+                <StackPanel Spacing="12">
+                    <Border Background="{DynamicResource PanelBackgroundBrush}"
+                            BorderBrush="{DynamicResource PanelBorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Padding="10">
+                        <StackPanel Spacing="8">
+                            <TextBlock Text="Fogadó" FontWeight="Bold" />
+                            <Grid RowDefinitions="Auto,Auto,Auto,Auto"
+                                  ColumnDefinitions="Auto,*,Auto"
+                                  ColumnSpacing="8"
+                                  RowSpacing="8">
+                                <TextBlock Grid.Row="0" Grid.Column="0" Text="Célmappa:" VerticalAlignment="Center" />
+                                <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding ReceiverDestination, Mode=TwoWay}" />
+                                <Button Grid.Row="0" Grid.Column="2" Content="Tallózás..." Click="BrowseDestination_OnClick" />
+
+                                <TextBlock Grid.Row="1" Grid.Column="0" Text="Port:" VerticalAlignment="Center" />
+                                <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding Port, Mode=OneWay}" IsReadOnly="True" Width="120" />
+                                <StackPanel Grid.Row="1" Grid.Column="2" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                                    <TextBlock Text="Helyi IP:" />
+                                    <TextBlock Text="{Binding LocalIp}" />
+                                </StackPanel>
+
+                                <TextBlock Grid.Row="2" Grid.Column="0" Text="Közös kulcs:" VerticalAlignment="Center" />
+                                <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding ReceiverSharedKey, Mode=TwoWay}" PasswordChar="*" />
+
+                                <Button Grid.Row="3" Grid.Column="0" Content="{Binding ReceiverButtonText}" Command="{Binding ToggleReceiverCommand}" />
+                                <TextBlock Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2" Text="{Binding ReceiverStatus}" VerticalAlignment="Center" />
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Background="{DynamicResource PanelBackgroundBrush}"
+                            BorderBrush="{DynamicResource PanelBorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Padding="10">
+                        <StackPanel Spacing="8">
+                            <TextBlock Text="Küldő" FontWeight="Bold" />
+                            <Grid RowDefinitions="Auto,Auto,Auto,Auto"
+                                  ColumnDefinitions="Auto,*,Auto,Auto"
+                                  ColumnSpacing="8"
+                                  RowSpacing="8">
+                                <TextBlock Grid.Row="0" Grid.Column="0" Text="Fogadó IP:" VerticalAlignment="Center" />
+                                <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding SenderIp, Mode=TwoWay}" />
+                                <TextBlock Grid.Row="0" Grid.Column="2" Text="Port:" VerticalAlignment="Center" />
+                                <TextBox Grid.Row="0" Grid.Column="3" Text="{Binding Port, Mode=OneWay}" IsReadOnly="True" Width="90" />
+
+                                <TextBlock Grid.Row="1" Grid.Column="0" Text="Közös kulcs:" VerticalAlignment="Center" />
+                                <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding SenderSharedKey, Mode=TwoWay}" PasswordChar="*" />
+                                <CheckBox Grid.Row="1" Grid.Column="2" Grid.ColumnSpan="2" Content="Ellenőrzőösszeg (lassabb)" IsChecked="{Binding UseChecksum, Mode=TwoWay}" />
+
+                                <ListBox Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="4" x:Name="FilesListBox"
+                                         ItemsSource="{Binding Files}" Height="160" SelectionMode="Multiple" />
+
+                                <StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="4" Orientation="Horizontal" Spacing="6">
+                                    <Button Content="Fájlok..." Click="AddFiles_OnClick" />
+                                    <Button Content="Mappák..." Click="AddFolder_OnClick" />
+                                    <Button Content="Eltávolítás" Click="RemoveSelected_OnClick" />
+                                    <Button Content="Ürítés" Click="Clear_OnClick" />
+                                    <Button Content="Leállítás" Command="{Binding StopSendCommand}" />
+                                    <Button Content="Küldés"
+                                            Command="{Binding SendCommand}"
+                                            Background="{DynamicResource AccentBrush}"
+                                            Foreground="{DynamicResource AccentForegroundBrush}" />
+                                </StackPanel>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Background="{DynamicResource PanelBackgroundBrush}"
+                            BorderBrush="{DynamicResource PanelBorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Padding="10">
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="Folyamat" FontWeight="Bold" />
+                            <ProgressBar Height="18"
+                                         Value="{Binding ProgressValue}"
+                                         IsIndeterminate="{Binding IsProgressIndeterminate}" />
+                            <TextBlock Text="{Binding ProgressLabel}"
+                                       TextWrapping="Wrap"
+                                       MaxLines="2"
+                                       TextTrimming="CharacterEllipsis" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border Background="{DynamicResource PanelBackgroundBrush}"
+                            BorderBrush="{DynamicResource PanelBorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="4"
+                            Padding="10">
+                        <StackPanel Spacing="6">
+                            <TextBlock Text="Napló" FontWeight="Bold" />
+                            <TextBox Text="{Binding LogOutput}"
+                                     AcceptsReturn="True"
+                                     IsReadOnly="True"
+                                     TextWrapping="Wrap"
+                                     Height="180" />
+                        </StackPanel>
+                    </Border>
+
+                    <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Left">
+                        <Button Content=".part fájlok törlése" Command="{Binding CleanPartFilesCommand}" />
+                        <TextBlock Text="LAN Drop (Avalonia)" VerticalAlignment="Center" Foreground="{DynamicResource TextMutedBrush}" />
+                    </StackPanel>
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
+    </Grid>
+</Window>

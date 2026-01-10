@@ -6,12 +6,15 @@ using System.Runtime.Versioning;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
+using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using KvmSwitch.Core.Interfaces;
 using KvmSwitch.Core.Models;
+using KvmSwitch.Desktop.Views;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace KvmSwitch.Desktop.ViewModels;
@@ -377,7 +380,41 @@ public partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     private void OpenFileTransfer()
     {
-        AppendLog("File transfer window not implemented yet.");
+        if (Application.Current?.ApplicationLifetime is not IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            return;
+        }
+
+        var mainWindow = desktop.MainWindow;
+        if (mainWindow is null)
+        {
+            return;
+        }
+
+        FileTransferWindow? existing = null;
+        foreach (var window in desktop.Windows)
+        {
+            if (window is FileTransferWindow fileTransfer)
+            {
+                existing = fileTransfer;
+                break;
+            }
+        }
+
+        if (existing is not null)
+        {
+            mainWindow.Hide();
+            existing.Show();
+            existing.WindowState = WindowState.Normal;
+            existing.Activate();
+            return;
+        }
+
+        var newWindow = App.Services.GetRequiredService<FileTransferWindow>();
+        mainWindow.Hide();
+        newWindow.Show();
+        newWindow.WindowState = WindowState.Normal;
+        newWindow.Activate();
     }
 
     [RelayCommand]

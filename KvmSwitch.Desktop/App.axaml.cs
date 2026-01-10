@@ -157,6 +157,8 @@ public partial class App : Application
 
         services.AddSingleton<MainWindowViewModel>();
         services.AddSingleton<MainWindow>();
+        services.AddTransient<FileTransferViewModel>();
+        services.AddTransient<FileTransferWindow>();
 
         return services.BuildServiceProvider();
     }

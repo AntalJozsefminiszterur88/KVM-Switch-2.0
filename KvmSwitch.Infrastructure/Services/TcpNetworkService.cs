@@ -1010,21 +1010,21 @@ namespace KvmSwitch.Infrastructure.Services
                 {
                     if (!await ReadExactAsync(connection.Stream, lengthBuffer, token).ConfigureAwait(false))
                     {
-                        RemoveClient(clientId, "Remote connection closed.");
+                        RemoveClient(clientId, "Remote connection closed.", expectedConnection: connection);
                         return;
                     }
 
                     int length = BitConverter.ToInt32(lengthBuffer, 0);
                     if (length <= 0)
                     {
-                        RemoveClient(clientId, "Invalid message length received.");
+                        RemoveClient(clientId, "Invalid message length received.", expectedConnection: connection);
                         return;
                     }
 
                     var payload = new byte[length];
                     if (!await ReadExactAsync(connection.Stream, payload, token).ConfigureAwait(false))
                     {
-                        RemoveClient(clientId, "Remote connection closed while reading payload.");
+                        RemoveClient(clientId, "Remote connection closed while reading payload.", expectedConnection: connection);
                         return;
                     }
 
@@ -1057,15 +1057,15 @@ namespace KvmSwitch.Infrastructure.Services
             }
             catch (IOException ex)
             {
-                RemoveClient(clientId, "TCP receive loop aborted due to IO error.", ex);
+                RemoveClient(clientId, "TCP receive loop aborted due to IO error.", ex, connection);
             }
             catch (SocketException ex)
             {
-                RemoveClient(clientId, "TCP receive loop aborted due to socket error.", ex);
+                RemoveClient(clientId, "TCP receive loop aborted due to socket error.", ex, connection);
             }
             catch (Exception ex)
             {
-                RemoveClient(clientId, "Unexpected error in TCP receive loop.", ex);
+                RemoveClient(clientId, "Unexpected error in TCP receive loop.", ex, connection);
             }
         }
 
@@ -1082,7 +1082,7 @@ namespace KvmSwitch.Infrastructure.Services
             }
             catch (Exception ex)
             {
-                RemoveClient(clientId, "Failed to send message.", ex);
+                RemoveClient(clientId, "Failed to send message.", ex, connection);
             }
             finally
             {
@@ -1100,12 +1100,36 @@ namespace KvmSwitch.Infrastructure.Services
                 StartHeartbeatLoop();
                 UpdateConnectionState();
                 ClientConnected?.Invoke(this, clientId);
+                return;
+            }
+
+            Log.Warning("TCP client {ClientId} already tracked. Closing duplicate connection.", clientId);
+            try
+            {
+                connection.Dispose();
+            }
+            catch (Exception disposeEx)
+            {
+                Log.Warning(disposeEx, "Error while disposing duplicate TCP client {ClientId}.", clientId);
             }
         }
 
-        private void RemoveClient(Guid clientId, string message, Exception? ex = null)
+        private void RemoveClient(Guid clientId, string message, Exception? ex = null, ClientConnection? expectedConnection = null)
         {
-            if (!_clients.TryRemove(clientId, out var connection))
+            ClientConnection? connection;
+            if (expectedConnection != null)
+            {
+                if (!_clients.TryGetValue(clientId, out connection) || !ReferenceEquals(connection, expectedConnection))
+                {
+                    return;
+                }
+
+                if (!_clients.TryRemove(new KeyValuePair<Guid, ClientConnection>(clientId, connection)))
+                {
+                    return;
+                }
+            }
+            else if (!_clients.TryRemove(clientId, out connection))
             {
                 return;
             }

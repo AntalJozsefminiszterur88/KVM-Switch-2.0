@@ -1,4 +1,5 @@
 ﻿using System;
+using System.IO;
 using System.Threading.Tasks;
 using Avalonia;
 using Serilog;
@@ -18,11 +19,14 @@ sealed class Program
 
         try
         {
+            WriteStartupLog("Starting application.");
             BuildAvaloniaApp()
                 .StartWithClassicDesktopLifetime(args);
+            WriteStartupLog("Application lifetime ended.");
         }
         catch (Exception ex)
         {
+            WriteStartupLog($"Fatal exception: {ex}");
             Log.Fatal(ex, "Fatal exception in application entry point.");
         }
         finally
@@ -42,17 +46,35 @@ sealed class Program
     {
         if (e.ExceptionObject is Exception ex)
         {
+            WriteStartupLog($"Unhandled exception (terminating={e.IsTerminating}): {ex}");
             Log.Fatal(ex, "Unhandled exception (terminating={IsTerminating}).", e.IsTerminating);
         }
         else
         {
+            WriteStartupLog($"Unhandled exception (terminating={e.IsTerminating}): {e.ExceptionObject}");
             Log.Fatal("Unhandled exception (terminating={IsTerminating}).", e.IsTerminating);
         }
     }
 
     private static void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
     {
+        WriteStartupLog($"Unobserved task exception: {e.Exception}");
         Log.Fatal(e.Exception, "Unobserved task exception.");
         e.SetObserved();
+    }
+
+    private static void WriteStartupLog(string message)
+    {
+        try
+        {
+            var logDir = Path.Combine(AppContext.BaseDirectory, "logs");
+            Directory.CreateDirectory(logDir);
+            var logPath = Path.Combine(logDir, "startup.log");
+            File.AppendAllText(logPath, $"{DateTime.Now:O} {message}{Environment.NewLine}");
+        }
+        catch
+        {
+            // Ignore logging failures during startup.
+        }
     }
 }
