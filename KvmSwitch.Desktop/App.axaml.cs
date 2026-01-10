@@ -6,6 +6,7 @@ using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Data.Core;
 using Avalonia.Data.Core.Plugins;
 using Avalonia.Markup.Xaml;
+using Avalonia.Platform;
 using Avalonia.Threading;
 using KvmSwitch.Core.Interfaces;
 using KvmSwitch.Desktop.Services;
@@ -36,8 +37,20 @@ public partial class App : Application
             DisableAvaloniaDataAnnotationValidation();
 
             var mainWindow = Services.GetRequiredService<MainWindow>();
-            mainWindow.DataContext = Services.GetRequiredService<MainWindowViewModel>();
+            var viewModel = Services.GetRequiredService<MainWindowViewModel>();
+            mainWindow.DataContext = viewModel;
             desktop.MainWindow = mainWindow;
+
+            var startHidden = viewModel.StartInTray || HasAutoStartArg();
+            if (startHidden)
+            {
+                Dispatcher.UIThread.Post(mainWindow.Hide);
+            }
+
+            EnsureTrayIcon();
+            DispatcherTimer.RunOnce(EnsureTrayIcon, TimeSpan.FromSeconds(3));
+
+            _ = viewModel.InitializeAsync();
         }
 
         base.OnFrameworkInitializationCompleted();
@@ -56,6 +69,26 @@ public partial class App : Application
     private void TrayIcon_Exit(object? sender, EventArgs e)
     {
         Dispatcher.UIThread.Post(ShutdownApplication);
+    }
+
+    private void EnsureTrayIcon()
+    {
+        var trayIcon = TrayIcon.GetIcons(this)?.FirstOrDefault();
+        if (trayIcon == null)
+        {
+            return;
+        }
+
+        try
+        {
+            var uri = new Uri("avares://KvmSwitch.Desktop/Assets/logo.ico");
+            using var stream = AssetLoader.Open(uri);
+            trayIcon.Icon = new WindowIcon(stream);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to set tray icon.");
+        }
     }
 
     private void ToggleMainWindow()
@@ -107,14 +140,33 @@ public partial class App : Application
 
         services.AddSingleton<IInputService, SharpHookInputService>();
         services.AddSingleton<INetworkService, TcpNetworkService>();
+        services.AddSingleton<IDataNetworkService, DataNetworkService>();
         services.AddSingleton<ISerialService, PicoSerialService>();
         services.AddSingleton<IMonitorControlService, WindowsMonitorControlService>();
         services.AddSingleton<IScreenService, ScreenService>();
+        if (OperatingSystem.IsWindows())
+        {
+            services.AddSingleton<IRegistryService, WindowsRegistryService>();
+        }
+        else
+        {
+            services.AddSingleton<IRegistryService, NoOpRegistryService>();
+        }
+        services.AddSingleton<IClipboardService, AvaloniaClipboardService>();
+        services.AddSingleton<ISettingsService, JsonSettingsService>();
 
         services.AddSingleton<MainWindowViewModel>();
         services.AddSingleton<MainWindow>();
 
         return services.BuildServiceProvider();
+    }
+
+    private static bool HasAutoStartArg()
+    {
+        var args = Environment.GetCommandLineArgs();
+        return args.Any(arg =>
+            string.Equals(arg, "--autostart", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(arg, "--start-hidden", StringComparison.OrdinalIgnoreCase));
     }
 
     private void DisableAvaloniaDataAnnotationValidation()

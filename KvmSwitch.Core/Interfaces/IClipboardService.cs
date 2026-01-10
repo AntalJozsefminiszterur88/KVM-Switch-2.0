@@ -1,15 +1,11 @@
 using System;
-using System.Collections.Generic;
-using System.Threading.Tasks;
 
-namespace KvmSwitch.Core.Interfaces
+namespace KvmSwitch.Core.Interfaces;
+
+public interface IClipboardService
 {
-    public interface IClipboardService
-    {
-        Task SetTextAsync(string text);
-        Task SetFilesAsync(IEnumerable<string> filePaths);
+    void Start();
+    void Stop();
 
-        event EventHandler<string> ClipboardTextChanged;
-        event EventHandler<IEnumerable<string>> ClipboardFilesChanged;
-    }
+    event EventHandler<string>? ClipboardTextChanged;
 }

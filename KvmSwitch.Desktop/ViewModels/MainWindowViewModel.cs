@@ -1,8 +1,9 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Principal;
 using System.Runtime.Versioning;
+using System.Threading;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
@@ -32,16 +33,25 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     private const string ControllerSerialPort = "COM7";
+    private const int ClipboardPort = 54545;
     private const double DefaultWindowWidth = 450;
     private const double ReceiverPanelWidth = 188;
     private const double ReceiverPanelSpacing = 12;
+    private const string AutostartAppName = "KvmSwitch";
+    private const int MouseSendIntervalMs = 8;
+    private const int MouseSendIdleTimeoutMs = 200;
 
     private readonly INetworkService _networkService;
+    private readonly IDataNetworkService _dataNetworkService;
     private readonly IInputService _inputService;
     private readonly ISerialService _serialService;
     private readonly IMonitorControlService _monitorControlService;
     private readonly IScreenService _screenService;
+    private readonly IRegistryService _registryService;
+    private readonly IClipboardService _clipboardService;
+    private readonly ISettingsService _settingsService;
     private readonly ILogger<MainWindowViewModel> _logger;
+    private bool _isLoadingSettings;
     private bool _updatingRoleSelection;
     private bool _serialSubscribed;
     private Guid? _inputProviderId;
@@ -60,6 +70,12 @@ public partial class MainWindowViewModel : ViewModelBase
     private int _receiverVirtualY;
     private bool _receiverVirtualInitialized;
     private readonly ConcurrentDictionary<Guid, (int Width, int Height)> _clientScreenSizes = new();
+    private readonly object _mouseSendLock = new();
+    private int _pendingMouseDeltaX;
+    private int _pendingMouseDeltaY;
+    private Guid? _pendingMouseTargetId;
+    private Task? _mouseSendTask;
+    private CancellationTokenSource? _mouseSendCts;
 
     [ObservableProperty]
     private DeviceRole selectedRole = DeviceRole.InputProvider;
@@ -84,6 +100,12 @@ public partial class MainWindowViewModel : ViewModelBase
 
     [ObservableProperty]
     private bool autoStartEnabled;
+
+    [ObservableProperty]
+    private bool autoStartService;
+
+    [ObservableProperty]
+    private bool startInTray;
 
     [ObservableProperty]
     private bool isServiceRunning;
@@ -111,20 +133,29 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public MainWindowViewModel(
         INetworkService networkService,
+        IDataNetworkService dataNetworkService,
         IInputService inputService,
         ISerialService serialService,
         IMonitorControlService monitorControlService,
         IScreenService screenService,
+        IRegistryService registryService,
+        IClipboardService clipboardService,
+        ISettingsService settingsService,
         ILogger<MainWindowViewModel> logger)
     {
         _networkService = networkService ?? throw new ArgumentNullException(nameof(networkService));
+        _dataNetworkService = dataNetworkService ?? throw new ArgumentNullException(nameof(dataNetworkService));
         _inputService = inputService ?? throw new ArgumentNullException(nameof(inputService));
         _serialService = serialService ?? throw new ArgumentNullException(nameof(serialService));
         _monitorControlService = monitorControlService ?? throw new ArgumentNullException(nameof(monitorControlService));
         _screenService = screenService ?? throw new ArgumentNullException(nameof(screenService));
+        _registryService = registryService ?? throw new ArgumentNullException(nameof(registryService));
+        _clipboardService = clipboardService ?? throw new ArgumentNullException(nameof(clipboardService));
+        _settingsService = settingsService ?? throw new ArgumentNullException(nameof(settingsService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
         _networkService.MessageReceived += OnMessageReceived;
+        _dataNetworkService.MessageReceived += OnDataMessageReceived;
         _networkService.ClientConnected += OnClientConnected;
         _networkService.ClientDisconnected += OnClientDisconnected;
         _inputService.InputReceived += OnInputReceived;
@@ -133,6 +164,13 @@ public partial class MainWindowViewModel : ViewModelBase
         SyncRoleSelection();
         UpdateStatusMessage();
         UpdateWindowWidth();
+        LoadSettings();
+        AutoStartEnabled = _registryService.IsAutostartEnabled(AutostartAppName) || AutoStartEnabled;
+        if (AutoStartEnabled)
+        {
+            var executablePath = Environment.ProcessPath;
+            _registryService.SetAutostartEnabled(AutostartAppName, executablePath, true);
+        }
     }
 
     partial void OnSelectedRoleChanged(DeviceRole value)
@@ -151,6 +189,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _receiverVirtualInitialized = false;
         UpdateWindowWidth();
         UpdateStatusMessage();
+        SaveSettings();
     }
 
     partial void OnIsControllerSelectedChanged(bool value)
@@ -186,6 +225,7 @@ public partial class MainWindowViewModel : ViewModelBase
     partial void OnPortChanged(int value)
     {
         _networkService.Port = value;
+        SaveSettings();
     }
 
     partial void OnIsServiceRunningChanged(bool value)
@@ -198,8 +238,50 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             _hasConnectedOnce = false;
         }
-
         UpdateStatusMessage();
+    }
+
+    partial void OnAutoStartEnabledChanged(bool value)
+    {
+        if (_isLoadingSettings)
+        {
+            return;
+        }
+
+        var executablePath = Environment.ProcessPath;
+        _registryService.SetAutostartEnabled(AutostartAppName, executablePath, value);
+        if (value)
+        {
+            StartInTray = true;
+            AutoStartService = true;
+        }
+
+        SaveSettings();
+    }
+
+    partial void OnAutoStartServiceChanged(bool value)
+    {
+        SaveSettings();
+    }
+
+    partial void OnStartInTrayChanged(bool value)
+    {
+        SaveSettings();
+    }
+
+    partial void OnHostMonitorCodeChanged(string value)
+    {
+        SaveSettings();
+    }
+
+    partial void OnClientMonitorCodeChanged(string value)
+    {
+        SaveSettings();
+    }
+
+    partial void OnReceiverHostIpChanged(string value)
+    {
+        SaveSettings();
     }
 
     [RelayCommand]
@@ -210,7 +292,19 @@ public partial class MainWindowViewModel : ViewModelBase
             StopServices();
             return;
         }
+        await StartServiceAsync().ConfigureAwait(false);
+    }
 
+    public async Task InitializeAsync()
+    {
+        if (AutoStartService && !IsServiceRunning)
+        {
+            await StartServiceAsync(fromStartup: true).ConfigureAwait(false);
+        }
+    }
+
+    private async Task StartServiceAsync(bool fromStartup = false)
+    {
         ClearStatusError();
         SetIsServiceRunning(true);
         AppendLog($"Service starting as {SelectedRole}...");
@@ -224,7 +318,9 @@ public partial class MainWindowViewModel : ViewModelBase
                 SubscribeSerial();
                 _serialService.Start(ControllerSerialPort);
                 await _networkService.StartServerAsync().ConfigureAwait(false);
+                await _dataNetworkService.StartServerAsync().ConfigureAwait(false);
                 await TryOpenFirewallPortAsync(Port).ConfigureAwait(false);
+                await TryOpenFirewallPortAsync(ClipboardPort).ConfigureAwait(false);
             }
             else
             {
@@ -233,15 +329,21 @@ public partial class MainWindowViewModel : ViewModelBase
                     await TryDeprioritizeVpnAsync().ConfigureAwait(false);
                 }
 
-                var hostAddress = SelectedRole == DeviceRole.Receiver
-                    ? ReceiverHostIp?.Trim()
-                    : null;
+                var hostAddress = ReceiverHostIp?.Trim();
                 if (string.IsNullOrWhiteSpace(hostAddress))
                 {
                     hostAddress = null;
                 }
 
                 await _networkService.StartClientAsync(hostAddress).ConfigureAwait(false);
+                await _dataNetworkService.StartClientAsync(hostAddress).ConfigureAwait(false);
+            }
+
+            _clipboardService.Start();
+            AutoStartService = true;
+            if (fromStartup)
+            {
+                StartInTray = true;
             }
 
             AppendLog("Service started.");
@@ -290,6 +392,9 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             try
             {
+                StopMouseSendLoop();
+                _clipboardService.Stop();
+                _dataNetworkService.Stop();
                 _networkService.Stop();
                 _inputService.Stop();
                 _serialService.Stop();
@@ -378,8 +483,7 @@ public partial class MainWindowViewModel : ViewModelBase
                         localWidth,
                         localHeight);
 
-                    var relativeEvent = inputEvent with { MouseX = scaledX, MouseY = scaledY };
-                    _ = _networkService.SendAsync(relativeEvent, _receiverId);
+                    QueueRelativeMouseMoveForReceiver(scaledX, scaledY, _receiverId.Value);
                 }
                 else
                 {
@@ -475,6 +579,19 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    private void OnDataMessageReceived(object? sender, (object Message, Guid ClientId) args)
+    {
+        if (SelectedRole != DeviceRole.Controller || !_dataNetworkService.IsServer)
+        {
+            return;
+        }
+
+        if (args.Message is ClipboardMessage clipboardMessage)
+        {
+            _ = _dataNetworkService.SendAsync(clipboardMessage);
+        }
+    }
+
     private void OnInputReceived(object? sender, InputEvent inputEvent)
     {
         if (SelectedRole != DeviceRole.InputProvider || !_networkService.IsConnected)
@@ -514,6 +631,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 _inputProviderScreenWidth = null;
                 _inputProviderScreenHeight = null;
                 _controllerVirtualInitialized = false;
+                ResetPendingMouse();
                 AppendLog("Input Provider disconnected.");
                 _logger.LogInformation("Input Provider disconnected: {ClientId}.", clientId);
                 UpdateStatusMessage();
@@ -523,6 +641,7 @@ public partial class MainWindowViewModel : ViewModelBase
             if (_receiverId == clientId)
             {
                 _receiverId = null;
+                ResetPendingMouse();
                 AppendLog("Receiver disconnected.");
                 _logger.LogInformation("Receiver disconnected: {ClientId}.", clientId);
                 UpdateStatusMessage();
@@ -945,6 +1064,7 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         _currentTarget = target;
+        ResetPendingMouse();
         UpdateStatusMessage();
     }
 
@@ -1028,6 +1148,69 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _statusErrorMessage = null;
         UpdateStatusMessage();
+    }
+
+    private void LoadSettings()
+    {
+        _isLoadingSettings = true;
+        try
+        {
+            var settings = _settingsService.Load();
+            if (settings.Port > 0)
+            {
+                Port = settings.Port;
+            }
+
+            if (!string.IsNullOrWhiteSpace(settings.HostMonitorCode))
+            {
+                HostMonitorCode = settings.HostMonitorCode;
+            }
+
+            if (!string.IsNullOrWhiteSpace(settings.ClientMonitorCode))
+            {
+                ClientMonitorCode = settings.ClientMonitorCode;
+            }
+
+            if (!string.IsNullOrWhiteSpace(settings.ReceiverHostIp))
+            {
+                ReceiverHostIp = settings.ReceiverHostIp;
+            }
+
+            if (Enum.IsDefined(typeof(DeviceRole), settings.SelectedRole))
+            {
+                SelectedRole = (DeviceRole)settings.SelectedRole;
+            }
+
+            AutoStartEnabled = settings.AutoStartEnabled;
+            AutoStartService = settings.AutoStartService;
+            StartInTray = settings.StartInTray;
+        }
+        finally
+        {
+            _isLoadingSettings = false;
+        }
+    }
+
+    private void SaveSettings()
+    {
+        if (_isLoadingSettings)
+        {
+            return;
+        }
+
+        var settings = new AppSettings
+        {
+            Port = Port,
+            HostMonitorCode = HostMonitorCode ?? string.Empty,
+            ClientMonitorCode = ClientMonitorCode ?? string.Empty,
+            AutoStartEnabled = AutoStartEnabled,
+            ReceiverHostIp = ReceiverHostIp ?? string.Empty,
+            SelectedRole = (int)SelectedRole,
+            AutoStartService = AutoStartService,
+            StartInTray = StartInTray
+        };
+
+        _settingsService.Save(settings);
     }
 
     private async Task TryOpenFirewallPortAsync(int port)
@@ -1283,4 +1466,122 @@ public partial class MainWindowViewModel : ViewModelBase
         return (virtualX, virtualY);
     }
 
+    private void QueueRelativeMouseMoveForReceiver(int deltaX, int deltaY, Guid receiverId)
+    {
+        if (deltaX == 0 && deltaY == 0)
+        {
+            return;
+        }
+
+        lock (_mouseSendLock)
+        {
+            _pendingMouseDeltaX += deltaX;
+            _pendingMouseDeltaY += deltaY;
+            _pendingMouseTargetId = receiverId;
+        }
+
+        EnsureMouseSendLoop();
+    }
+
+    private void EnsureMouseSendLoop()
+    {
+        lock (_mouseSendLock)
+        {
+            if (_mouseSendTask != null && !_mouseSendTask.IsCompleted)
+            {
+                return;
+            }
+
+            _mouseSendCts?.Dispose();
+            _mouseSendCts = new CancellationTokenSource();
+            _mouseSendTask = Task.Run(() => MouseSendLoopAsync(_mouseSendCts.Token));
+        }
+    }
+
+    private async Task MouseSendLoopAsync(CancellationToken token)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(MouseSendIntervalMs));
+        var idleSince = DateTime.UtcNow;
+
+        while (await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
+        {
+            int deltaX;
+            int deltaY;
+            Guid? targetId;
+
+            lock (_mouseSendLock)
+            {
+                deltaX = _pendingMouseDeltaX;
+                deltaY = _pendingMouseDeltaY;
+                _pendingMouseDeltaX = 0;
+                _pendingMouseDeltaY = 0;
+                targetId = _pendingMouseTargetId;
+            }
+
+            if (deltaX == 0 && deltaY == 0)
+            {
+                if (DateTime.UtcNow - idleSince > TimeSpan.FromMilliseconds(MouseSendIdleTimeoutMs))
+                {
+                    break;
+                }
+
+                continue;
+            }
+
+            idleSince = DateTime.UtcNow;
+
+            if (targetId is null)
+            {
+                continue;
+            }
+
+            try
+            {
+                var inputEvent = new InputEvent
+                {
+                    EventType = InputEventType.MouseMove,
+                    MouseX = deltaX,
+                    MouseY = deltaY,
+                    IsRelative = true
+                };
+
+                await _networkService.SendAsync(inputEvent, targetId.Value).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to send throttled mouse move.");
+            }
+        }
+
+        lock (_mouseSendLock)
+        {
+            _mouseSendTask = null;
+            _mouseSendCts?.Dispose();
+            _mouseSendCts = null;
+        }
+    }
+
+    private void StopMouseSendLoop()
+    {
+        lock (_mouseSendLock)
+        {
+            _pendingMouseDeltaX = 0;
+            _pendingMouseDeltaY = 0;
+            _pendingMouseTargetId = null;
+            _mouseSendCts?.Cancel();
+        }
+    }
+
+    private void ResetPendingMouse()
+    {
+        lock (_mouseSendLock)
+        {
+            _pendingMouseDeltaX = 0;
+            _pendingMouseDeltaY = 0;
+            _pendingMouseTargetId = null;
+        }
+    }
+
 }
+
+

@@ -10,10 +10,12 @@ namespace KvmSwitch.Infrastructure.Services
 {
     public sealed class SharpHookInputService : IInputService
     {
+        private const double ScrollScale = 0.576;
         private readonly object _sync = new();
         private readonly EventSimulator _eventSimulator = new();
         private SimpleGlobalHook? _hook;
         private Task? _hookTask;
+        private CancellationTokenSource? _hookCts;
         private volatile bool _suppressLocalInput = true;
         private int _centerX;
         private int _centerY;
@@ -23,6 +25,7 @@ namespace KvmSwitch.Infrastructure.Services
         private bool _isResettingPosition;
         private int? _boundsWidth;
         private int? _boundsHeight;
+        private double _scrollRemainder;
 
         public event EventHandler<InputEvent>? InputReceived;
 
@@ -49,30 +52,19 @@ namespace KvmSwitch.Infrastructure.Services
         {
             lock (_sync)
             {
-                if (_hook != null)
+                if (_hookTask != null)
                 {
                     return;
                 }
 
                 try
                 {
-                    _hook = new SimpleGlobalHook(runAsyncOnBackgroundThread: true);
-                    _hook.KeyPressed += OnKeyPressed;
-                    _hook.KeyReleased += OnKeyReleased;
-                    _hook.MouseMoved += OnMouseMoved;
-                    _hook.MouseDragged += OnMouseDragged;
-                    _hook.MousePressed += OnMousePressed;
-                    _hook.MouseReleased += OnMouseReleased;
-                    _hook.MouseWheel += OnMouseWheel;
-
+                    _hookCts = new CancellationTokenSource();
                     _suppressLocalInput = true;
                     ResetCaptureState();
                     InitializeCenterFromBounds();
                     LockPointerToCenter();
-                    _hookTask = _hook.RunAsync();
-                    _hookTask.ContinueWith(
-                        t => Log.Error(t.Exception, "SharpHook input hook terminated with an error."),
-                        TaskContinuationOptions.OnlyOnFaulted);
+                    _hookTask = Task.Run(() => RunHookLoopAsync(_hookCts.Token));
 
                     Log.Information("SharpHook input service started.");
                 }
@@ -88,14 +80,17 @@ namespace KvmSwitch.Infrastructure.Services
         {
             lock (_sync)
             {
-                if (_hook == null)
+                if (_hookTask == null)
                 {
                     return;
                 }
 
                 try
                 {
-                    _hook.Dispose();
+                    _hookCts?.Cancel();
+                    _hookCts?.Dispose();
+                    _hookCts = null;
+                    _hook?.Dispose();
                     _hook = null;
                     _hookTask = null;
                     _suppressLocalInput = false;
@@ -106,6 +101,76 @@ namespace KvmSwitch.Infrastructure.Services
                 {
                     Log.Error(ex, "Failed to stop SharpHook input service.");
                     throw;
+                }
+            }
+        }
+
+        private async Task RunHookLoopAsync(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                SimpleGlobalHook? hook = null;
+
+                try
+                {
+                    hook = new SimpleGlobalHook();
+                    hook.KeyPressed += OnKeyPressed;
+                    hook.KeyReleased += OnKeyReleased;
+                    hook.MouseMoved += OnMouseMoved;
+                    hook.MouseDragged += OnMouseDragged;
+                    hook.MousePressed += OnMousePressed;
+                    hook.MouseReleased += OnMouseReleased;
+                    hook.MouseWheel += OnMouseWheel;
+
+                    lock (_sync)
+                    {
+                        _hook = hook;
+                    }
+
+                    ResetCaptureState();
+                    InitializeCenterFromBounds();
+                    LockPointerToCenter();
+
+                    await hook.RunAsync().ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "Input hook crashed, restarting...");
+                }
+                finally
+                {
+                    try
+                    {
+                        hook?.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warning(ex, "Failed to dispose SharpHook instance.");
+                    }
+
+                    lock (_sync)
+                    {
+                        if (ReferenceEquals(_hook, hook))
+                        {
+                            _hook = null;
+                        }
+                    }
+                }
+
+                if (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -150,7 +215,19 @@ namespace KvmSwitch.Infrastructure.Services
 
         private void OnKeyPressed(object? sender, KeyboardHookEventArgs e)
         {
-            SuppressIfNeeded(e);
+            if (_suppressLocalInput)
+            {
+                e.SuppressEvent = true;
+                if (e.IsEventSimulated)
+                {
+                    return;
+                }
+            }
+            else
+            {
+                SuppressIfNeeded(e);
+            }
+
             RaiseInputReceived(new InputEvent
             {
                 EventType = InputEventType.KeyDown,
@@ -160,7 +237,19 @@ namespace KvmSwitch.Infrastructure.Services
 
         private void OnKeyReleased(object? sender, KeyboardHookEventArgs e)
         {
-            SuppressIfNeeded(e);
+            if (_suppressLocalInput)
+            {
+                e.SuppressEvent = true;
+                if (e.IsEventSimulated)
+                {
+                    return;
+                }
+            }
+            else
+            {
+                SuppressIfNeeded(e);
+            }
+
             RaiseInputReceived(new InputEvent
             {
                 EventType = InputEventType.KeyUp,
@@ -237,10 +326,19 @@ namespace KvmSwitch.Infrastructure.Services
                 SuppressIfNeeded(e);
             }
 
+            var delta = _suppressLocalInput
+                ? ApplyScrollScale(e.Data.Rotation)
+                : e.Data.Rotation;
+
+            if (delta == 0)
+            {
+                return;
+            }
+
             RaiseInputReceived(new InputEvent
             {
                 EventType = InputEventType.MouseWheel,
-                MouseButton = e.Data.Rotation
+                MouseButton = delta
             });
         }
 
@@ -319,6 +417,7 @@ namespace KvmSwitch.Infrastructure.Services
             _centerY = 0;
             _lastX = 0;
             _lastY = 0;
+            _scrollRemainder = 0;
         }
 
         private void InitializeCenterFromBounds()
@@ -379,6 +478,19 @@ namespace KvmSwitch.Infrastructure.Services
                 _isResettingPosition = false;
                 Log.Warning(ex, "Failed to lock mouse position.");
             }
+        }
+
+        private int ApplyScrollScale(int delta)
+        {
+            if (delta == 0)
+            {
+                return 0;
+            }
+
+            var scaled = (delta * ScrollScale) + _scrollRemainder;
+            var output = (int)Math.Truncate(scaled);
+            _scrollRemainder = scaled - output;
+            return output;
         }
     }
 }
