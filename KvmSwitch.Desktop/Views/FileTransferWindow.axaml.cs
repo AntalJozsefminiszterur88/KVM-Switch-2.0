@@ -35,6 +35,12 @@ public partial class FileTransferWindow : Window
 
     protected override void OnClosing(WindowClosingEventArgs e)
     {
+        if (App.IsExiting)
+        {
+            base.OnClosing(e);
+            return;
+        }
+
         if (!e.IsProgrammatic
             && (e.CloseReason == WindowCloseReason.WindowClosing
                 || e.CloseReason == WindowCloseReason.Undefined))

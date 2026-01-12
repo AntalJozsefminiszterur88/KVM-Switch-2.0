@@ -21,6 +21,7 @@ namespace KvmSwitch.Desktop;
 public partial class App : Application
 {
     public static IServiceProvider Services { get; private set; } = default!;
+    internal static bool IsExiting { get; private set; }
 
     public override void Initialize()
     {
@@ -115,10 +116,20 @@ public partial class App : Application
         window.Activate();
     }
 
-    private void ShutdownApplication()
+    private async void ShutdownApplication()
     {
+        IsExiting = true;
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
+            try
+            {
+                var viewModel = Services.GetRequiredService<MainWindowViewModel>();
+                await viewModel.ShutdownAsync().ConfigureAwait(true);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Failed to stop services during shutdown.");
+            }
             desktop.Shutdown();
             return;
         }

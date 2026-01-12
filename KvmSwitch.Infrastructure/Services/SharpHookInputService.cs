@@ -10,7 +10,7 @@ namespace KvmSwitch.Infrastructure.Services
 {
     public sealed class SharpHookInputService : IInputService
     {
-        private const double ScrollScale = 0.576;
+        private const double ScrollScale = 0.5184;
         private readonly object _sync = new();
         private readonly EventSimulator _eventSimulator = new();
         private SimpleGlobalHook? _hook;
@@ -50,8 +50,14 @@ namespace KvmSwitch.Infrastructure.Services
 
         public void Start()
         {
+            Start(suppressLocalInput: true);
+        }
+
+        public void Start(bool suppressLocalInput)
+        {
             lock (_sync)
             {
+                _suppressLocalInput = suppressLocalInput;
                 if (_hookTask != null)
                 {
                     return;
@@ -60,10 +66,12 @@ namespace KvmSwitch.Infrastructure.Services
                 try
                 {
                     _hookCts = new CancellationTokenSource();
-                    _suppressLocalInput = true;
                     ResetCaptureState();
-                    InitializeCenterFromBounds();
-                    LockPointerToCenter();
+                    if (_suppressLocalInput)
+                    {
+                        InitializeCenterFromBounds();
+                        LockPointerToCenter();
+                    }
                     _hookTask = Task.Run(() => RunHookLoopAsync(_hookCts.Token));
 
                     Log.Information("SharpHook input service started.");
@@ -128,8 +136,11 @@ namespace KvmSwitch.Infrastructure.Services
                     }
 
                     ResetCaptureState();
-                    InitializeCenterFromBounds();
-                    LockPointerToCenter();
+                    if (_suppressLocalInput)
+                    {
+                        InitializeCenterFromBounds();
+                        LockPointerToCenter();
+                    }
 
                     await hook.RunAsync().ConfigureAwait(false);
                 }
@@ -215,13 +226,14 @@ namespace KvmSwitch.Infrastructure.Services
 
         private void OnKeyPressed(object? sender, KeyboardHookEventArgs e)
         {
+            if (e.IsEventSimulated && _suppressLocalInput)
+            {
+                return;
+            }
+
             if (_suppressLocalInput)
             {
                 e.SuppressEvent = true;
-                if (e.IsEventSimulated)
-                {
-                    return;
-                }
             }
             else
             {
@@ -237,13 +249,14 @@ namespace KvmSwitch.Infrastructure.Services
 
         private void OnKeyReleased(object? sender, KeyboardHookEventArgs e)
         {
+            if (e.IsEventSimulated && _suppressLocalInput)
+            {
+                return;
+            }
+
             if (_suppressLocalInput)
             {
                 e.SuppressEvent = true;
-                if (e.IsEventSimulated)
-                {
-                    return;
-                }
             }
             else
             {

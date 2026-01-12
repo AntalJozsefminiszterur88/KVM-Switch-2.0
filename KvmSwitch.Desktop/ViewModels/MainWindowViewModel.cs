@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Security.Principal;
 using System.Runtime.Versioning;
@@ -16,6 +17,7 @@ using KvmSwitch.Core.Models;
 using KvmSwitch.Desktop.Views;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using SharpHook.Data;
 
 namespace KvmSwitch.Desktop.ViewModels;
 
@@ -43,6 +45,15 @@ public partial class MainWindowViewModel : ViewModelBase
     private const string AutostartAppName = "KvmSwitch";
     private const int MouseSendIntervalMs = 8;
     private const int MouseSendIdleTimeoutMs = 200;
+    private const KeyCode MonitorOnOffFunctionKey = KeyCode.VcF21;
+    private const KeyCode Hdmi1FunctionKey = KeyCode.VcF16;
+    private const KeyCode Hdmi2FunctionKey = KeyCode.VcF17;
+    private const KeyCode Hang1FunctionKey = KeyCode.VcF18;
+    private const KeyCode Hang2FunctionKey = KeyCode.VcF19;
+    private const KeyCode Hang3FunctionKey = KeyCode.VcF20;
+    private const int MonitorOnOffAltKeyCode1 = -132;
+    private const int MonitorOnOffAltKeyCode2 = 108;
+    private const int HotkeySuppressionWindowMs = 250;
 
     private readonly INetworkService _networkService;
     private readonly IDataNetworkService _dataNetworkService;
@@ -74,6 +85,8 @@ public partial class MainWindowViewModel : ViewModelBase
     private bool _receiverVirtualInitialized;
     private readonly ConcurrentDictionary<Guid, (int Width, int Height)> _clientScreenSizes = new();
     private readonly object _mouseSendLock = new();
+    private readonly object _hotkeySuppressionLock = new();
+    private readonly Dictionary<int, long> _hotkeySuppression = new();
     private int _pendingMouseDeltaX;
     private int _pendingMouseDeltaY;
     private Guid? _pendingMouseTargetId;
@@ -324,6 +337,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 await _dataNetworkService.StartServerAsync().ConfigureAwait(false);
                 await TryOpenFirewallPortAsync(Port).ConfigureAwait(false);
                 await TryOpenFirewallPortAsync(ClipboardPort).ConfigureAwait(false);
+                TryStartHotkeyCapture();
             }
             else
             {
@@ -425,7 +439,17 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void StopServices()
     {
-        _ = Task.Run(() =>
+        _ = StopServicesAsync();
+    }
+
+    public Task ShutdownAsync()
+    {
+        return StopServicesAsync();
+    }
+
+    private Task StopServicesAsync()
+    {
+        return Task.Run(() =>
         {
             try
             {
@@ -631,12 +655,89 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void OnInputReceived(object? sender, InputEvent inputEvent)
     {
+        if (SelectedRole == DeviceRole.Controller && TryHandleHotkeyInput(inputEvent))
+        {
+            return;
+        }
+
         if (SelectedRole != DeviceRole.InputProvider || !_networkService.IsConnected)
         {
             return;
         }
 
         _ = SendInputAsync(inputEvent);
+    }
+
+    private void TryStartHotkeyCapture()
+    {
+        try
+        {
+            _inputService.Start(suppressLocalInput: false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to start hotkey capture.");
+            AppendLog("Error: Failed to start hotkey capture.");
+            SetStatusError("Failed to start hotkey capture.");
+        }
+    }
+
+    private bool TryHandleHotkeyInput(InputEvent inputEvent)
+    {
+        if (inputEvent.EventType != InputEventType.KeyDown)
+        {
+            return false;
+        }
+
+        if (IsHotkeySuppressed(inputEvent.Key))
+        {
+            return false;
+        }
+
+        if (inputEvent.Key == (int)MonitorOnOffFunctionKey
+            || inputEvent.Key == MonitorOnOffAltKeyCode1
+            || inputEvent.Key == MonitorOnOffAltKeyCode2)
+        {
+            _ = ToggleMonitorPowerAsync();
+            LogCommandAction("Hotkey: Monitor Power Toggle");
+            return true;
+        }
+
+        if (inputEvent.Key == (int)Hdmi1FunctionKey)
+        {
+            _ = SwitchMonitorAsync(HostMonitorCode);
+            LogCommandAction("Hotkey: HDMI 1");
+            return true;
+        }
+
+        if (inputEvent.Key == (int)Hdmi2FunctionKey)
+        {
+            _ = SwitchMonitorAsync(ClientMonitorCode);
+            LogCommandAction("Hotkey: HDMI 2");
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool IsHotkeySuppressed(int keyCode)
+    {
+        var now = Environment.TickCount64;
+        lock (_hotkeySuppressionLock)
+        {
+            if (!_hotkeySuppression.TryGetValue(keyCode, out var expiresAt))
+            {
+                return false;
+            }
+
+            if (expiresAt < now)
+            {
+                _hotkeySuppression.Remove(keyCode);
+                return false;
+            }
+
+            return true;
+        }
     }
 
     private void OnClientConnected(object? sender, Guid clientId)
@@ -710,9 +811,11 @@ public partial class MainWindowViewModel : ViewModelBase
 
         try
         {
+            _logger.LogDebug("Preparing role handshake for {Role}. ThreadId={ThreadId}.", role.Value, Environment.CurrentManagedThreadId);
             var message = new ClientRoleMessage { Role = role.Value };
 
-            var (width, height) = _screenService.GetPrimaryScreenSize();
+            var (width, height) = await Dispatcher.UIThread
+                .InvokeAsync(() => _screenService.GetPrimaryScreenSize());
             if (width > 0 && height > 0)
             {
                 message.ScreenWidth = (int)Math.Round(width);
@@ -724,28 +827,32 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to send role handshake.");
+            _logger.LogWarning(ex, "Failed to send role handshake for {Role}.", role.Value);
         }
     }
 
     private async Task SendScreenSizeMessageAsync(Guid? targetClientId)
     {
-        var (width, height) = _screenService.GetPrimaryScreenSize();
-        var widthValue = (int)Math.Round(width);
-        var heightValue = (int)Math.Round(height);
-        if (widthValue <= 0 || heightValue <= 0)
-        {
-            return;
-        }
-
-        var message = $"ScreenSize|{widthValue}|{heightValue}";
         try
         {
+            _logger.LogDebug("Preparing screen size message for {ClientId}. ThreadId={ThreadId}.", targetClientId, Environment.CurrentManagedThreadId);
+            var (width, height) = await Dispatcher.UIThread
+                .InvokeAsync(() => _screenService.GetPrimaryScreenSize());
+            var widthValue = (int)Math.Round(width);
+            var heightValue = (int)Math.Round(height);
+            if (widthValue <= 0 || heightValue <= 0)
+            {
+                _logger.LogDebug("Screen size unavailable (width={Width} height={Height}) for {ClientId}.", widthValue, heightValue, targetClientId);
+                return;
+            }
+
+            var message = $"ScreenSize|{widthValue}|{heightValue}";
             await _networkService.SendAsync(message, targetClientId).ConfigureAwait(false);
+            _logger.LogDebug("Screen size message sent to {ClientId} ({Width}x{Height}).", targetClientId, widthValue, heightValue);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to send screen size message.");
+            _logger.LogWarning(ex, "Failed to send screen size message to {ClientId}.", targetClientId);
         }
     }
 
@@ -926,6 +1033,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (string.Equals(command, "KEY_HDMI_1", StringComparison.OrdinalIgnoreCase))
         {
             await SwitchMonitorAsync(HostMonitorCode).ConfigureAwait(false);
+            PressFunctionKey(Hdmi1FunctionKey, "HDMI 1");
             LogCommandAction("Manual override: HDMI 1");
             return;
         }
@@ -933,6 +1041,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (string.Equals(command, "KEY_HDMI_2", StringComparison.OrdinalIgnoreCase))
         {
             await SwitchMonitorAsync(ClientMonitorCode).ConfigureAwait(false);
+            PressFunctionKey(Hdmi2FunctionKey, "HDMI 2");
             LogCommandAction("Manual override: HDMI 2");
             return;
         }
@@ -940,24 +1049,28 @@ public partial class MainWindowViewModel : ViewModelBase
         if (string.Equals(command, "KEY_Monitor_OnOff", StringComparison.OrdinalIgnoreCase))
         {
             await ToggleMonitorPowerAsync().ConfigureAwait(false);
+            PressFunctionKey(MonitorOnOffFunctionKey, "Monitor On/Off");
             LogCommandAction("Monitor Power Toggle");
             return;
         }
 
         if (string.Equals(command, "KEY_Hang_1", StringComparison.OrdinalIgnoreCase))
         {
+            PressFunctionKey(Hang1FunctionKey, "Hang 1");
             LogCommandAction("Audio 1 key pressed (Placeholder)");
             return;
         }
 
         if (string.Equals(command, "KEY_Hang_2", StringComparison.OrdinalIgnoreCase))
         {
+            PressFunctionKey(Hang2FunctionKey, "Hang 2");
             LogCommandAction("Audio 2 key pressed (Placeholder)");
             return;
         }
 
         if (string.Equals(command, "KEY_Hang_3", StringComparison.OrdinalIgnoreCase))
         {
+            PressFunctionKey(Hang3FunctionKey, "Hang 3");
             LogCommandAction("Audio 3 key pressed (Placeholder)");
             return;
         }
@@ -1009,6 +1122,39 @@ public partial class MainWindowViewModel : ViewModelBase
             _logger.LogError(ex, "Failed to toggle monitor power.");
             AppendLog("Error: Failed to toggle monitor power.");
             SetStatusError("Failed to toggle monitor power.");
+        }
+    }
+
+    private void PressFunctionKey(KeyCode keyCode, string label)
+    {
+        try
+        {
+            SuppressHotkey((int)keyCode);
+            _inputService.SimulateInput(new InputEvent
+            {
+                EventType = InputEventType.KeyDown,
+                Key = (int)keyCode
+            });
+            _inputService.SimulateInput(new InputEvent
+            {
+                EventType = InputEventType.KeyUp,
+                Key = (int)keyCode
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to simulate {Label} key {KeyCode}.", label, keyCode);
+            AppendLog($"Error: Failed to simulate {label} key.");
+            SetStatusError($"Failed to simulate {label} key.");
+        }
+    }
+
+    private void SuppressHotkey(int keyCode)
+    {
+        var expiresAt = Environment.TickCount64 + HotkeySuppressionWindowMs;
+        lock (_hotkeySuppressionLock)
+        {
+            _hotkeySuppression[keyCode] = expiresAt;
         }
     }
 

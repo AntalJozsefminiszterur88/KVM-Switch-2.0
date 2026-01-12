@@ -13,6 +13,7 @@ namespace KvmSwitch.Infrastructure.Services
         private const byte VcpPowerModeCode = 0xD6;
         private const uint PowerOn = 0x01;
         private const uint PowerOff = 0x04;
+        private bool _isMonitorOn = true;
 
         public Task SwitchInputAsync(int inputSourceId)
         {
@@ -44,7 +45,7 @@ namespace KvmSwitch.Infrastructure.Services
             return Task.CompletedTask;
         }
 
-        private static void SwitchInput(uint inputSourceId)
+        private void SwitchInput(uint inputSourceId)
         {
             var physicalMonitors = GetAllPhysicalMonitors();
             if (physicalMonitors.Count == 0)
@@ -69,7 +70,7 @@ namespace KvmSwitch.Infrastructure.Services
             }
         }
 
-        private static void TogglePower()
+        private void TogglePower()
         {
             var physicalMonitors = GetAllPhysicalMonitors();
             if (physicalMonitors.Count == 0)
@@ -82,19 +83,32 @@ namespace KvmSwitch.Infrastructure.Services
             {
                 foreach (var monitor in physicalMonitors)
                 {
+                    var useCachedState = true;
                     uint currentValue = 0;
                     uint maxValue = 0;
-                    if (!GetVCPFeatureAndVCPFeatureReply(monitor.hPhysicalMonitor, VcpPowerModeCode, ref currentValue, ref maxValue))
+                    if (GetVCPFeatureAndVCPFeatureReply(
+                        monitor.hPhysicalMonitor,
+                        VcpPowerModeCode,
+                        out _,
+                        ref currentValue,
+                        ref maxValue))
+                    {
+                        _isMonitorOn = currentValue != PowerOff;
+                        useCachedState = false;
+                    }
+                    else
                     {
                         Log.Warning("Failed to read power state for monitor {Description}.", monitor.szPhysicalMonitorDescription);
-                        continue;
                     }
 
-                    var newValue = currentValue == PowerOn ? PowerOff : PowerOn;
+                    var newValue = (useCachedState ? _isMonitorOn : currentValue != PowerOff) ? PowerOff : PowerOn;
                     if (!SetVCPFeature(monitor.hPhysicalMonitor, VcpPowerModeCode, newValue))
                     {
                         Log.Warning("Failed to set power state for monitor {Description}.", monitor.szPhysicalMonitorDescription);
+                        continue;
                     }
+
+                    _isMonitorOn = newValue == PowerOn;
                 }
             }
             finally
@@ -163,6 +177,7 @@ namespace KvmSwitch.Infrastructure.Services
         private static extern bool GetVCPFeatureAndVCPFeatureReply(
             IntPtr hMonitor,
             byte bVCPCode,
+            out int pvct,
             ref uint pdwCurrentValue,
             ref uint pdwMaximumValue);
 
