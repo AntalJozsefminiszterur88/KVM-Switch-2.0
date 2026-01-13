@@ -28,6 +28,7 @@ namespace KvmSwitch.Infrastructure.Services
                 throw new ArgumentException("Port name is required.", nameof(portName));
             }
 
+            CancellationToken token;
             lock (_sync)
             {
                 if (_readTask != null)
@@ -37,19 +38,18 @@ namespace KvmSwitch.Infrastructure.Services
 
                 _portName = portName;
                 _cts = new CancellationTokenSource();
+                token = _cts.Token;
+                _readTask = Task.Run(() => ReadLoopAsync(token));
             }
 
             try
             {
                 EnsurePortOpen();
-                _readTask = Task.Run(() => ReadLoopAsync(_cts!.Token));
                 Log.Information("Serial service started on {PortName}.", portName);
             }
             catch (Exception ex)
             {
-                Log.Error(ex, "Failed to start serial service on {PortName}.", portName);
-                Stop();
-                throw;
+                Log.Warning(ex, "Serial port {PortName} unavailable. Retrying in background.", portName);
             }
         }
 
@@ -144,7 +144,15 @@ namespace KvmSwitch.Infrastructure.Services
                     ReadTimeout = ReadTimeoutMs
                 };
 
-                port.Open();
+                try
+                {
+                    port.Open();
+                }
+                catch
+                {
+                    port.Dispose();
+                    throw;
+                }
                 _port = port;
             }
         }
