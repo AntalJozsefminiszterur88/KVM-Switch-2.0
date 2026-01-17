@@ -54,6 +54,33 @@ public partial class MainWindowViewModel : ViewModelBase
     private const int MonitorOnOffAltKeyCode1 = -132;
     private const int MonitorOnOffAltKeyCode2 = 108;
     private const int HotkeySuppressionWindowMs = 250;
+    private static readonly Dictionary<string, KeyCode> KeyAliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["CTRL"] = KeyCode.VcLeftControl,
+        ["CONTROL"] = KeyCode.VcLeftControl,
+        ["ALT"] = KeyCode.VcLeftAlt,
+        ["SHIFT"] = KeyCode.VcLeftShift,
+        ["WIN"] = KeyCode.VcLeftMeta,
+        ["META"] = KeyCode.VcLeftMeta,
+        ["SUPER"] = KeyCode.VcLeftMeta,
+        ["TAB"] = KeyCode.VcTab,
+        ["ENTER"] = KeyCode.VcEnter,
+        ["ESC"] = KeyCode.VcEscape,
+        ["ESCAPE"] = KeyCode.VcEscape,
+        ["SPACE"] = KeyCode.VcSpace,
+        ["BACKSPACE"] = KeyCode.VcBackspace,
+        ["DEL"] = KeyCode.VcDelete,
+        ["DELETE"] = KeyCode.VcDelete,
+        ["INSERT"] = KeyCode.VcInsert,
+        ["HOME"] = KeyCode.VcHome,
+        ["END"] = KeyCode.VcEnd,
+        ["PAGEUP"] = KeyCode.VcPageUp,
+        ["PAGEDOWN"] = KeyCode.VcPageDown,
+        ["UP"] = KeyCode.VcUp,
+        ["DOWN"] = KeyCode.VcDown,
+        ["LEFT"] = KeyCode.VcLeft,
+        ["RIGHT"] = KeyCode.VcRight
+    };
 
     private readonly INetworkService _networkService;
     private readonly IDataNetworkService _dataNetworkService;
@@ -145,7 +172,15 @@ public partial class MainWindowViewModel : ViewModelBase
     private double windowWidth = DefaultWindowWidth;
 
     [ObservableProperty]
+    private bool isMainViewVisible = true;
+
+    [ObservableProperty]
+    private bool isButtonMappingVisible;
+
+    [ObservableProperty]
     private string logOutput = string.Empty;
+
+    public ButtonMappingViewModel ButtonMapping { get; }
 
     public MainWindowViewModel(
         INetworkService networkService,
@@ -157,6 +192,7 @@ public partial class MainWindowViewModel : ViewModelBase
         IRegistryService registryService,
         IClipboardService clipboardService,
         ISettingsService settingsService,
+        ButtonMappingViewModel buttonMappingViewModel,
         ILogger<MainWindowViewModel> logger)
     {
         _networkService = networkService ?? throw new ArgumentNullException(nameof(networkService));
@@ -169,6 +205,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _clipboardService = clipboardService ?? throw new ArgumentNullException(nameof(clipboardService));
         _settingsService = settingsService ?? throw new ArgumentNullException(nameof(settingsService));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        ButtonMapping = buttonMappingViewModel ?? throw new ArgumentNullException(nameof(buttonMappingViewModel));
 
         _networkService.MessageReceived += OnMessageReceived;
         _dataNetworkService.MessageReceived += OnDataMessageReceived;
@@ -176,6 +213,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _networkService.ClientDisconnected += OnClientDisconnected;
         _inputService.InputReceived += OnInputReceived;
         _networkService.Port = Port;
+        ButtonMapping.RequestClose += OnButtonMappingClose;
 
         SyncRoleSelection();
         UpdateStatusMessage();
@@ -380,8 +418,10 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         if (Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
-            desktop.MainWindow?.Show();
-            desktop.MainWindow?.Activate();
+            if (desktop.MainWindow is Window window)
+            {
+                App.ShowWindowCentered(window);
+            }
         }
     }
 
@@ -432,9 +472,16 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     [RelayCommand]
-    private void OpenClipboard()
+    private void OpenButtonMapping()
     {
-        AppendLog("Clipboard window not implemented yet.");
+        IsMainViewVisible = false;
+        IsButtonMappingVisible = true;
+    }
+
+    private void OnButtonMappingClose()
+    {
+        IsButtonMappingVisible = false;
+        IsMainViewVisible = true;
     }
 
     private void StopServices()
@@ -524,6 +571,16 @@ public partial class MainWindowViewModel : ViewModelBase
                     AppendLog("Error: Failed to handle control command.");
                     SetStatusError("Failed to handle control command.");
                 }
+            }
+
+            return;
+        }
+
+        if (message is MappedButtonMessage mappedButtonMessage)
+        {
+            if (SelectedRole == DeviceRole.Receiver || SelectedRole == DeviceRole.InputProvider)
+            {
+                TryExecuteMappedAction(mappedButtonMessage.Action);
             }
 
             return;
@@ -958,6 +1015,77 @@ public partial class MainWindowViewModel : ViewModelBase
         _ = HandleCommandAsync(command);
     }
 
+    private void OnRawButtonReceived(object? sender, string buttonId)
+    {
+        if (SelectedRole != DeviceRole.Controller)
+        {
+            return;
+        }
+
+        if (ButtonMapping.IsListening)
+        {
+            return;
+        }
+
+        if (!ButtonMapping.TryGetMapping(buttonId, out var mapping))
+        {
+            return;
+        }
+
+        _ = HandleMappedButtonAsync(mapping);
+    }
+
+    private async Task HandleMappedButtonAsync(ButtonMapping mapping)
+    {
+        if (mapping == null || string.IsNullOrWhiteSpace(mapping.Action))
+        {
+            return;
+        }
+
+        if (mapping.Target == ButtonMappingTarget.Local)
+        {
+            TryExecuteMappedAction(mapping.Action);
+            return;
+        }
+
+        if (mapping.Target == ButtonMappingTarget.InputProvider)
+        {
+            if (_inputProviderId is null)
+            {
+                AppendLog("Mapped button ignored: Input Provider not connected.");
+                _logger.LogWarning("Mapped button ignored because Input Provider is not connected.");
+                return;
+            }
+
+            await SendMappedButtonToClientAsync(_inputProviderId.Value, mapping.Action).ConfigureAwait(false);
+            return;
+        }
+
+        if (_receiverId is null)
+        {
+            AppendLog("Mapped button ignored: Receiver not connected.");
+            _logger.LogWarning("Mapped button ignored because receiver is not connected.");
+            return;
+        }
+
+        await SendMappedButtonToClientAsync(_receiverId.Value, mapping.Action).ConfigureAwait(false);
+    }
+
+    private async Task SendMappedButtonToClientAsync(Guid clientId, string action)
+    {
+        try
+        {
+            var message = new MappedButtonMessage { Action = action };
+            await _networkService.SendAsync(message, clientId).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send mapped button action.");
+            AppendLog("Error: Failed to send mapped button action.");
+            SetStatusError("Failed to send mapped button action.");
+        }
+    }
+
     private async Task SendInputAsync(InputEvent inputEvent)
     {
         try
@@ -1149,6 +1277,145 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    private void TryExecuteMappedAction(string action)
+    {
+        if (!TryParseAction(action, out var chords))
+        {
+            AppendLog($"Invalid mapped action: {action}");
+            _logger.LogWarning("Invalid mapped action: {Action}.", action);
+            return;
+        }
+
+        try
+        {
+            foreach (var chord in chords)
+            {
+                foreach (var keyCode in chord)
+                {
+                    SuppressHotkey(keyCode);
+                    SimulateKey(keyCode, isDown: true);
+                }
+
+                for (var i = chord.Count - 1; i >= 0; i--)
+                {
+                    SimulateKey(chord[i], isDown: false);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to execute mapped action.");
+            AppendLog("Error: Failed to execute mapped action.");
+            SetStatusError("Failed to execute mapped action.");
+        }
+    }
+
+    private void SimulateKey(int keyCode, bool isDown)
+    {
+        _inputService.SimulateInput(new InputEvent
+        {
+            EventType = isDown ? InputEventType.KeyDown : InputEventType.KeyUp,
+            Key = keyCode
+        });
+    }
+
+    private static bool TryParseAction(string action, out List<IReadOnlyList<int>> chords)
+    {
+        chords = new List<IReadOnlyList<int>>();
+        if (string.IsNullOrWhiteSpace(action))
+        {
+            return false;
+        }
+
+        var segments = action.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var segment in segments)
+        {
+            var tokens = segment.Split(new[] { '+' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var chord = new List<int>();
+            foreach (var token in tokens)
+            {
+                if (!TryParseKeyToken(token, out var keyCode))
+                {
+                    return false;
+                }
+
+                chord.Add(keyCode);
+            }
+
+            if (chord.Count > 0)
+            {
+                chords.Add(chord);
+            }
+        }
+
+        return chords.Count > 0;
+    }
+
+    private static bool TryParseKeyToken(string token, out int keyCode)
+    {
+        keyCode = 0;
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return false;
+        }
+
+        var trimmed = token.Trim();
+        if (int.TryParse(trimmed, out var numeric))
+        {
+            keyCode = numeric;
+            return true;
+        }
+
+        if (KeyAliases.TryGetValue(trimmed, out var alias))
+        {
+            keyCode = (int)alias;
+            return true;
+        }
+
+        if (trimmed.Length == 1)
+        {
+            var ch = trimmed[0];
+            if (char.IsLetter(ch))
+            {
+                var name = $"Vc{char.ToUpperInvariant(ch)}";
+                if (Enum.TryParse(name, out KeyCode letterKey))
+                {
+                    keyCode = (int)letterKey;
+                    return true;
+                }
+            }
+            else if (char.IsDigit(ch))
+            {
+                var name = $"Vc{ch}";
+                if (Enum.TryParse(name, out KeyCode digitKey))
+                {
+                    keyCode = (int)digitKey;
+                    return true;
+                }
+            }
+        }
+
+        if (trimmed.StartsWith("F", StringComparison.OrdinalIgnoreCase)
+            && trimmed.Length > 1
+            && int.TryParse(trimmed[1..], out var functionNumber))
+        {
+            var name = $"VcF{functionNumber}";
+            if (Enum.TryParse(name, out KeyCode functionKey))
+            {
+                keyCode = (int)functionKey;
+                return true;
+            }
+        }
+
+        if (Enum.TryParse(trimmed, true, out KeyCode parsed))
+        {
+            keyCode = (int)parsed;
+            return true;
+        }
+
+        return false;
+    }
+
     private void SuppressHotkey(int keyCode)
     {
         var expiresAt = Environment.TickCount64 + HotkeySuppressionWindowMs;
@@ -1183,6 +1450,7 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         _serialService.CommandReceived += OnCommandReceived;
+        _serialService.RawButtonReceived += OnRawButtonReceived;
         _serialSubscribed = true;
     }
 
@@ -1194,6 +1462,7 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         _serialService.CommandReceived -= OnCommandReceived;
+        _serialService.RawButtonReceived -= OnRawButtonReceived;
         _serialSubscribed = false;
     }
 
@@ -1381,17 +1650,16 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        var settings = new AppSettings
-        {
-            Port = Port,
-            HostMonitorCode = HostMonitorCode ?? string.Empty,
-            ClientMonitorCode = ClientMonitorCode ?? string.Empty,
-            AutoStartEnabled = AutoStartEnabled,
-            ReceiverHostIp = ReceiverHostIp ?? string.Empty,
-            SelectedRole = (int)SelectedRole,
-            AutoStartService = AutoStartService,
-            StartInTray = StartInTray
-        };
+        var settings = _settingsService.Load();
+        settings.Port = Port;
+        settings.HostMonitorCode = HostMonitorCode ?? string.Empty;
+        settings.ClientMonitorCode = ClientMonitorCode ?? string.Empty;
+        settings.AutoStartEnabled = AutoStartEnabled;
+        settings.ReceiverHostIp = ReceiverHostIp ?? string.Empty;
+        settings.SelectedRole = (int)SelectedRole;
+        settings.AutoStartService = AutoStartService;
+        settings.StartInTray = StartInTray;
+        settings.ButtonMappings ??= new List<ButtonMapping>();
 
         _settingsService.Save(settings);
     }

@@ -3,6 +3,7 @@
         xmlns:vm="using:KvmSwitch.Desktop.ViewModels"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:views="using:KvmSwitch.Desktop.Views"
         mc:Ignorable="d"
         x:Class="KvmSwitch.Desktop.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
@@ -49,10 +50,12 @@
         </ResourceDictionary>
     </Window.Resources>
 
-    <Grid Margin="16"
-          ColumnDefinitions="*,Auto"
-          ColumnSpacing="12"
-          VerticalAlignment="Top">
+    <Grid>
+        <Grid Margin="16"
+              ColumnDefinitions="*,Auto"
+              ColumnSpacing="12"
+              VerticalAlignment="Top"
+              IsVisible="{Binding IsMainViewVisible}">
         <StackPanel Grid.Column="0"
                     Spacing="12">
         <Border Background="{DynamicResource PanelBackgroundBrush}"
@@ -158,8 +161,8 @@
                         <TextBlock Text="LAN fájlátvitel megnyitása" TextWrapping="Wrap" TextAlignment="Center" />
                     </Button>
                     <Button x:Name="ClipboardButton"
-                            Content="Közös vágólap"
-                            Command="{Binding OpenClipboardCommand}" HorizontalAlignment="Stretch" />
+                            Content="Egyéb szinkronizáció"
+                            Command="{Binding OpenButtonMappingCommand}" HorizontalAlignment="Stretch" />
                 </StackPanel>
             </StackPanel>
 
@@ -213,6 +216,11 @@
                            TextWrapping="Wrap" />
             </StackPanel>
         </Border>
+        </Grid>
+
+        <Grid IsVisible="{Binding IsButtonMappingVisible}">
+            <views:ButtonMappingView DataContext="{Binding ButtonMapping}" />
+        </Grid>
     </Grid>
 </Window>
 

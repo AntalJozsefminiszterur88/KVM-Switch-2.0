@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+
 namespace KvmSwitch.Core.Models
 {
     public sealed class AppSettings
@@ -10,5 +12,6 @@ namespace KvmSwitch.Core.Models
         public int SelectedRole { get; set; } = 1;
         public bool AutoStartService { get; set; }
         public bool StartInTray { get; set; }
+        public List<ButtonMapping> ButtonMappings { get; set; } = new();
     }
 }

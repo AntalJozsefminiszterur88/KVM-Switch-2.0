@@ -627,17 +627,12 @@ public partial class FileTransferViewModel : ViewModelBase
 
             if (Directory.Exists(item))
             {
-                var baseName = Path.GetFileName(Path.GetFullPath(item).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
-                var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                var zipPath = Path.Combine(GetTempDirectory(), $"{baseName}_{timestamp}.zip");
-
                 AppendLog($"Mappa tömörítése: {item}...");
-                SetIndeterminateProgress($"Tömörítés: {baseName}.zip...");
-                CreateZipFromDirectory(item, zipPath, token);
+                var archive = CreateArchiveFromDirectory(item, token);
 
-                output.Add(zipPath);
-                tempFiles.Add(zipPath);
-                AppendLog($"ZIP kész ({HumanBytes(new FileInfo(zipPath).Length)}).");
+                output.Add(archive.Path);
+                tempFiles.Add(archive.Path);
+                AppendLog($"{archive.Kind} kész ({HumanBytes(new FileInfo(archive.Path).Length)}).");
             }
             else if (File.Exists(item))
             {
@@ -653,17 +648,91 @@ public partial class FileTransferViewModel : ViewModelBase
         return output;
     }
 
-    private void CreateZipFromDirectory(string sourceDirectory, string destinationZip, CancellationToken token)
+    private (string Path, string Kind) CreateArchiveFromDirectory(string sourceDirectory, CancellationToken token)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(destinationZip) ?? ".");
+        var baseName = Path.GetFileName(Path.GetFullPath(sourceDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+        var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        var archivePath = Path.Combine(GetTempDirectory(), $"{baseName}_{timestamp}.zip");
+        var archiveName = Path.GetFileName(archivePath);
+        var progressName = $"Tömörítés {archiveName}";
+        SetIndeterminateProgress($"Tömörítés: {archiveName}...");
+
+        var files = CollectArchiveEntries(sourceDirectory, token, out var totalBytes);
+        if (totalBytes > 0)
+        {
+            UpdateProgress(progressName, 0, totalBytes, 0);
+        }
+
         var rootParent = Directory.GetParent(sourceDirectory)?.FullName ?? sourceDirectory;
 
-        using var archive = ZipFile.Open(destinationZip, ZipArchiveMode.Create);
+        try
+        {
+            CreateZipFromDirectory(files, rootParent, archivePath, progressName, totalBytes, token);
+        }
+        catch
+        {
+            SafeRemove(archivePath);
+            throw;
+        }
+        finally
+        {
+            ResetProgress();
+        }
+
+        return (archivePath, "ZIP");
+    }
+
+    private List<ArchiveFileEntry> CollectArchiveEntries(string sourceDirectory, CancellationToken token, out long totalBytes)
+    {
+        var files = new List<ArchiveFileEntry>();
+        totalBytes = 0;
+
         foreach (var file in EnumerateFiles(sourceDirectory, token))
         {
             token.ThrowIfCancellationRequested();
-            var entryName = Path.GetRelativePath(rootParent, file);
-            archive.CreateEntryFromFile(file, entryName, CompressionLevel.Optimal);
+            var info = new FileInfo(file);
+            files.Add(new ArchiveFileEntry(file, info.Length));
+            totalBytes += info.Length;
+        }
+
+        return files;
+    }
+
+    private void CreateZipFromDirectory(
+        IReadOnlyList<ArchiveFileEntry> files,
+        string rootParent,
+        string destinationZip,
+        string progressName,
+        long totalBytes,
+        CancellationToken token)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(destinationZip) ?? ".");
+        var buffer = new byte[ChunkSize];
+        var processed = 0L;
+        var stopwatch = Stopwatch.StartNew();
+
+        using var archive = ZipFile.Open(destinationZip, ZipArchiveMode.Create);
+        foreach (var file in files)
+        {
+            token.ThrowIfCancellationRequested();
+            var entryName = Path.GetRelativePath(rootParent, file.Path);
+            var entry = archive.CreateEntry(entryName, CompressionLevel.Optimal);
+            using var entryStream = entry.Open();
+            using var fileStream = new FileStream(
+                file.Path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                ChunkSize,
+                FileOptions.SequentialScan);
+            int read;
+            while ((read = fileStream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                token.ThrowIfCancellationRequested();
+                entryStream.Write(buffer, 0, read);
+                processed += read;
+                UpdateProgress(progressName, processed, totalBytes, stopwatch.Elapsed.TotalSeconds);
+            }
         }
     }
 
@@ -755,6 +824,7 @@ public partial class FileTransferViewModel : ViewModelBase
                 // ignore
             }
         }
+
     }
 
     private void LoadSettings()
@@ -1211,6 +1281,18 @@ public partial class FileTransferViewModel : ViewModelBase
         using var identity = WindowsIdentity.GetCurrent();
         var principal = new WindowsPrincipal(identity);
         return principal.IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private sealed class ArchiveFileEntry
+    {
+        public ArchiveFileEntry(string path, long size)
+        {
+            Path = path;
+            Size = size;
+        }
+
+        public string Path { get; }
+        public long Size { get; }
     }
 
     private sealed class TransferHeader

@@ -20,6 +20,7 @@ namespace KvmSwitch.Infrastructure.Services
         private string? _portName;
 
         public event EventHandler<string>? CommandReceived;
+        public event EventHandler<string>? RawButtonReceived;
 
         public void Start(string portName)
         {
@@ -108,7 +109,9 @@ namespace KvmSwitch.Infrastructure.Services
                     var line = port.ReadLine();
                     if (!string.IsNullOrWhiteSpace(line))
                     {
-                        CommandReceived?.Invoke(this, line.Trim());
+                        var trimmed = line.Trim();
+                        RawButtonReceived?.Invoke(this, trimmed);
+                        CommandReceived?.Invoke(this, trimmed);
                     }
                 }
                 catch (TimeoutException)

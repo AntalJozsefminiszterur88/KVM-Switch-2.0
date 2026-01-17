@@ -8,5 +8,6 @@ namespace KvmSwitch.Core.Interfaces
         void Stop();
 
         event EventHandler<string> CommandReceived;
+        event EventHandler<string>? RawButtonReceived;
     }
 }

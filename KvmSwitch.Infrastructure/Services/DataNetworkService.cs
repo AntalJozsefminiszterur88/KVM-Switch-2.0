@@ -6,12 +6,14 @@ using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Runtime.Versioning;
 using System.Threading;
 using System.Threading.Tasks;
 using KvmSwitch.Core.Interfaces;
 using Makaretu.Dns;
 using MessagePack;
 using MessagePack.Resolvers;
+using Microsoft.Win32;
 using Serilog;
 
 namespace KvmSwitch.Infrastructure.Services
@@ -44,19 +46,26 @@ namespace KvmSwitch.Infrastructure.Services
         private const string ServiceType = "_kvmswitch-data._tcp";
         private const string ServiceInstanceName = "kvmclipboard";
         private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan HeartbeatTimeout = TimeSpan.FromSeconds(15);
+        private const string PingMessage = "Ping";
+        private const string PongMessage = "Pong";
         private static readonly DomainName ServiceTypeName = new(ServiceType);
 
         private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
+        private readonly ConcurrentDictionary<Guid, DateTime> _lastPong = new();
         private readonly object _sync = new();
         private TcpListener? _listener;
         private CancellationTokenSource? _cts;
         private Task? _acceptTask;
         private Task? _clientLoopTask;
+        private Task? _heartbeatTask;
         private ServiceDiscovery? _serviceDiscovery;
         private ServiceProfile? _serviceProfile;
         private int _connectionInProgress;
         private volatile bool _isConnected;
         private volatile bool _isServer;
+        private bool _powerEventsSubscribed;
 
         public event EventHandler<(object Message, Guid ClientId)>? MessageReceived;
         public event EventHandler<Guid>? ClientConnected;
@@ -91,6 +100,8 @@ namespace KvmSwitch.Infrastructure.Services
                 _isServer = true;
                 _acceptTask = Task.Run(() => AcceptLoopAsync(_listener, _cts.Token));
                 StartServiceAdvertisement();
+                EnsurePowerEventsSubscribed();
+                StartHeartbeatLoop();
             }
 
             Log.Information("Data TCP server listening on port {Port}.", DataPort);
@@ -120,6 +131,8 @@ namespace KvmSwitch.Infrastructure.Services
 
                 _cts = new CancellationTokenSource();
                 _isServer = false;
+                EnsurePowerEventsSubscribed();
+                StartHeartbeatLoop();
 
                 if (string.IsNullOrWhiteSpace(hostAddress))
                 {
@@ -199,6 +212,7 @@ namespace KvmSwitch.Infrastructure.Services
                 _listener = null;
                 _acceptTask = null;
                 _clientLoopTask = null;
+                _heartbeatTask = null;
                 serviceDiscovery = _serviceDiscovery;
                 _serviceDiscovery = null;
                 _serviceProfile = null;
@@ -244,7 +258,135 @@ namespace KvmSwitch.Infrastructure.Services
             }
 
             UpdateConnectionState();
+            UnsubscribePowerEvents();
             Log.Information("Data TCP network service stopped.");
+        }
+
+        private void EnsurePowerEventsSubscribed()
+        {
+            if (!OperatingSystem.IsWindows() || _powerEventsSubscribed)
+            {
+                return;
+            }
+
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            _powerEventsSubscribed = true;
+        }
+
+        private void UnsubscribePowerEvents()
+        {
+            if (!OperatingSystem.IsWindows() || !_powerEventsSubscribed)
+            {
+                return;
+            }
+
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            _powerEventsSubscribed = false;
+        }
+
+        [SupportedOSPlatform("windows")]
+        private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+        {
+            if (e.Mode == PowerModes.Suspend)
+            {
+                Log.Information("System suspend detected. Closing data connections.");
+                HandleSuspend();
+                return;
+            }
+
+            if (e.Mode == PowerModes.Resume)
+            {
+                Log.Information("System resume detected. Triggering data reconnect.");
+                HandleResume();
+            }
+        }
+
+        private void HandleSuspend()
+        {
+            foreach (var clientId in _clients.Keys)
+            {
+                RemoveClient(clientId, "System suspend.");
+            }
+
+            UpdateConnectionState();
+        }
+
+        private void HandleResume()
+        {
+            if (_serviceDiscovery != null && !_isServer)
+            {
+                try
+                {
+                    _serviceDiscovery.QueryServiceInstances(ServiceTypeName);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "Data service discovery query failed after resume.");
+                }
+            }
+        }
+
+        private void StartHeartbeatLoop()
+        {
+            if (_cts == null || _heartbeatTask != null)
+            {
+                return;
+            }
+
+            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_cts.Token));
+        }
+
+        private async Task HeartbeatLoopAsync(CancellationToken token)
+        {
+            using var timer = new PeriodicTimer(HeartbeatInterval);
+            while (await timer.WaitForNextTickAsync(token).ConfigureAwait(false))
+            {
+                if (_clients.IsEmpty)
+                {
+                    continue;
+                }
+
+                var now = DateTime.UtcNow;
+                foreach (var clientId in _clients.Keys)
+                {
+                    if (_lastPong.TryGetValue(clientId, out var lastSeen)
+                        && now - lastSeen > HeartbeatTimeout)
+                    {
+                        RemoveClient(clientId, "Heartbeat timeout.");
+                        continue;
+                    }
+
+                    _ = SendAsync(PingMessage, clientId);
+                }
+            }
+        }
+
+        private void TouchHeartbeat(Guid clientId)
+        {
+            _lastPong[clientId] = DateTime.UtcNow;
+        }
+
+        private bool TryHandleHeartbeatMessage(Guid clientId, object message)
+        {
+            if (message is not string text)
+            {
+                return false;
+            }
+
+            if (string.Equals(text, PingMessage, StringComparison.OrdinalIgnoreCase))
+            {
+                TouchHeartbeat(clientId);
+                _ = SendAsync(PongMessage, clientId);
+                return true;
+            }
+
+            if (string.Equals(text, PongMessage, StringComparison.OrdinalIgnoreCase))
+            {
+                TouchHeartbeat(clientId);
+                return true;
+            }
+
+            return false;
         }
 
         private void StartServiceAdvertisement()
@@ -737,6 +879,12 @@ namespace KvmSwitch.Infrastructure.Services
 
                     if (message != null)
                     {
+                        if (TryHandleHeartbeatMessage(clientId, message))
+                        {
+                            continue;
+                        }
+
+                        TouchHeartbeat(clientId);
                         MessageReceived?.Invoke(this, (message, clientId));
                     }
                 }
@@ -785,6 +933,8 @@ namespace KvmSwitch.Infrastructure.Services
             var connection = new ClientConnection(client);
             if (_clients.TryAdd(clientId, connection))
             {
+                TouchHeartbeat(clientId);
+                StartHeartbeatLoop();
                 UpdateConnectionState();
                 ClientConnected?.Invoke(this, clientId);
                 return;
@@ -821,6 +971,7 @@ namespace KvmSwitch.Infrastructure.Services
                 return;
             }
 
+            _lastPong.TryRemove(clientId, out _);
             if (ex == null)
             {
                 Log.Warning("{Message} ClientId={ClientId}", message, clientId);
